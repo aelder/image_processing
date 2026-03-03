@@ -1,57 +1,159 @@
-Create a color-based timeline from every frame of an exported movie.
+# img-timeline
 
-This tool takes a TIFF frame sequence (for example, frames exported from a film), calculates the average color of each frame, and stacks those colors in order to produce a timeline image. The result is a compact color summary of the full movie.
+Create a color timeline from every frame of an exported movie.
 
-If you stretch the 1px-per-frame timeline in an image editor, you can turn it into an average-color poster of the entire film: a color infographic that shows the movie's palette progression over time.
+![CI](https://github.com/aelder/image_processing/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Preferred workflow (single command)
+`img-timeline` reads a TIFF frame sequence, computes the average color per frame, and writes a timeline image with one row per frame.  
+Stretch that timeline vertically in an editor and you get an average-color poster of the entire film: a clean visual infographic of palette over time.
 
-Use `tif_pipeline.py` to process source frames directly into the final timeline image:
+## Sample Output
 
-```bash
-python3 tif_pipeline.py /path/to/input_frames /path/to/stacked_output.tif
-```
-
-Optionally write intermediate 1px strips while also producing the final timeline:
-
-```bash
-python3 tif_pipeline.py /path/to/input_frames /path/to/stacked_output.tif --intermediate-dir /path/to/output_strips
-```
-
-With progress bars (if `tqdm` is installed):
+Generated from 500 synthetic rainbow frames using:
 
 ```bash
-python3 tif_pipeline.py /path/to/input_frames /path/to/stacked_output.tif --progress
+img-timeline generate-demo ./rainbow --count 500 --size 2
+img-timeline build ./rainbow ./rainbow_timeline.tif
 ```
 
-## Legacy two-step workflow (still supported)
+![Sample timeline output](./assets/sample_timeline_preview.png)
 
-Step 1: convert each source frame into a 1-pixel-high strip of the frame's average color.
+## Why this tool
+
+- Turns thousands of frames into one compact visual summary
+- Deterministic output (sorted filename order)
+- Works as a one-command pipeline or step-by-step workflow
+- Supports optional intermediate strip output for debugging/inspection
+
+## Install
+
+### Recommended (virtual environment)
 
 ```bash
-python3 tif_convert.py /path/to/input_frames /path/to/output_strips
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .[progress]
 ```
 
-Step 2: stack strips top-to-bottom in filename order.
+### Command installed
 
 ```bash
-python3 tif_stacker.py /path/to/output_strips /path/to/stacked_output.tif
+img-timeline
 ```
 
-With progress bars in step 2:
+## Quickstart (60 seconds)
+
+1. Put movie frames (`.tif` / `.tiff`) in a folder, e.g. `./frames`.
+2. Run:
 
 ```bash
-python3 tif_stacker.py /path/to/output_strips /path/to/stacked_output.tif --progress
+img-timeline build ./frames ./out/movie_timeline.tif --progress
 ```
+
+3. Open `movie_timeline.tif` and scale it up vertically to create a poster-style graphic.
+
+## Cookbook Recipes
+
+### 1) Export TIFF frames from a movie (ffmpeg)
+
+```bash
+mkdir -p ./frames
+ffmpeg -i ./movie.mp4 -vsync 0 ./frames/%06d.tif
+```
+
+### 2) Build a timeline in one command
+
+```bash
+mkdir -p ./out
+img-timeline build ./frames ./out/movie_timeline.tif --progress
+```
+
+### 3) Keep intermediate strips for inspection
+
+```bash
+mkdir -p ./out/strips
+img-timeline build ./frames ./out/movie_timeline.tif --intermediate-dir ./out/strips --progress
+```
+
+### 4) Legacy two-step workflow
+
+```bash
+img-timeline convert ./frames ./out/strips
+img-timeline stack ./out/strips ./out/movie_timeline.tif --progress
+```
+
+### 5) Generate demo data and run end-to-end
+
+```bash
+img-timeline generate-demo ./demo_frames --count 500 --size 2
+img-timeline build ./demo_frames ./out/demo_timeline.tif
+```
+
+### 6) Make a poster-style image from the timeline
+
+`movie_timeline.tif` is typically narrow (often 1-2px wide). Scale it up in an editor or with ImageMagick:
+
+```bash
+magick ./out/movie_timeline.tif -filter point -resize 2000x30000! ./out/movie_poster.png
+```
+
+Use `-filter point` to preserve hard row boundaries without blending.
+
+## CLI Reference
+
+| Command | Purpose | Example |
+|---|---|---|
+| `img-timeline build <input_folder> <output_file>` | Full pipeline from source frames to final timeline | `img-timeline build ./frames ./out/timeline.tif` |
+| `img-timeline convert <input_folder> <output_folder>` | Convert each frame to a 1px strip of its average color | `img-timeline convert ./frames ./out/strips` |
+| `img-timeline stack <input_folder> <output_file>` | Stack strips into final timeline | `img-timeline stack ./out/strips ./out/timeline.tif` |
+| `img-timeline generate-demo <output_dir>` | Create synthetic rainbow TIFF frames for testing | `img-timeline generate-demo ./demo_frames --count 500 --size 2` |
+
+### Useful flags
+
+- `--progress`: show progress bars (requires `tqdm`)
+- `--intermediate-dir <dir>` (for `build`): also write 1px strip TIFFs
+
+## How output is computed
+
+For each input frame:
+
+1. Convert to RGB
+2. Compute average RGB color
+3. Assign one output row to that color
+
+Final timeline dimensions:
+
+- Width: max width across input frames
+- Height: number of input frames
+
+## Recommended frame naming
+
+Use zero-padded names so lexical sort matches frame order:
+
+- Good: `000001.tif`, `000002.tif`, ...
+- Risky: `1.tif`, `10.tif`, `2.tif`
+
+## Legacy script entrypoints (still supported)
+
+- `python3 tif_pipeline.py ...`
+- `python3 tif_convert.py ...`
+- `python3 tif_stacker.py ...`
+- `python3 generate_rainbow_tiffs.py ...`
 
 ## Requirements
 
 - Python 3.10+
-- Pillow (`pip install pillow`)
-- Optional: tqdm (`pip install tqdm`) for progress bars
+- Pillow
+- Optional: `tqdm` for progress bars
 
-## Notes
+## Troubleshooting
 
-- Supported input extensions: `.tif`, `.tiff`
-- Files are processed in sorted lexical filename order for deterministic output.
-- The final timeline has one row per input frame.
+- `FileNotFoundError`: input folder path is wrong or not a directory.
+- `ValueError: No TIFF files found`: input directory has no `.tif` / `.tiff`.
+- If `pip install -e .` fails with an externally-managed Python error, install inside a virtual environment (see Install section).
+
+## License
+
+MIT-style usage as provided in [`LICENSE`](./LICENSE).
