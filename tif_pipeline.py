@@ -43,6 +43,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.output_file,
         intermediate_dir=args.intermediate_dir,
         show_progress=args.progress,
+        mode="average",
     )
     print(f"Processed {count} TIFF frame(s) into {args.output_file}")
     return 0

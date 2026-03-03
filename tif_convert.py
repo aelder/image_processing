@@ -30,7 +30,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def process_images(input_folder: Path, output_folder: Path) -> int:
-    return convert_to_strips(input_folder, output_folder)
+    return convert_to_strips(input_folder, output_folder, mode="average")
 
 
 def main(argv: Iterable[str] | None = None) -> int:

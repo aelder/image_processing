@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "movie-color-timeline"
-version = "0.1.1"
+version = "0.1.2"
 description = "Movie color analysis tool for building frame-by-frame average color timeline posters."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
+  "numpy>=1.26.0",
   "Pillow>=10.0.0",
 ]
 

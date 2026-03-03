@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import colorsys
+import concurrent.futures
+import os
+import re
 import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageStat
 
 try:
@@ -31,6 +35,39 @@ SUPPORTED_VIDEO_SUFFIXES = {
     ".3gp",
 }
 OUTPUT_FORMATS = {"tiff", "png"}
+TIMELINE_MODES = {"average", "flow"}
+DITHER_MODES = {"none", "floyd-steinberg"}
+PALETTE_COLOR_COUNT = 16
+PALETTE_MIN_DISTANCE = 24
+DEFAULT_FILMIC_16_PALETTE: tuple[tuple[int, int, int], ...] = (
+    (6, 8, 12),
+    (27, 20, 16),
+    (39, 52, 69),
+    (68, 45, 37),
+    (82, 92, 71),
+    (104, 70, 53),
+    (78, 108, 132),
+    (124, 96, 73),
+    (92, 128, 97),
+    (152, 102, 68),
+    (132, 124, 97),
+    (110, 150, 166),
+    (181, 132, 84),
+    (164, 168, 124),
+    (201, 178, 122),
+    (241, 229, 190),
+)
+FLOW_QUANTIZATION_SIZE = 16
+FLOW_BASE_COLOR_WEIGHT = 0.10
+FLOW_VIBRANCE_WEIGHT = 0.60
+FLOW_LUMINANCE_WEIGHT = 0.30
+FLOW_NEAR_BLACK_LUMA_THRESHOLD = 0.08
+FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD = 0.30
+FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD = 0.50
+FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD = 0.50
+FLOW_NEAR_BLACK_PENALTY_MULTIPLIER = 0.15
+FLOW_NEAR_BLACK_DOMINANCE_BOOST = 0.20
+DEFAULT_AUTO_MIN_FRAMES = 8
 
 
 def iter_image_files(input_folder: Path) -> list[Path]:
@@ -108,6 +145,109 @@ def _normalize_output_format(output_format: str | None, output_file: Path | None
     return normalized
 
 
+def _normalize_mode(mode: str | None) -> str:
+    normalized = "average" if mode is None else mode.lower()
+    if normalized not in TIMELINE_MODES:
+        allowed = ", ".join(sorted(TIMELINE_MODES))
+        raise ValueError(f"Unsupported mode: {mode}. Choose one of: {allowed}")
+    return normalized
+
+
+def _normalize_dither(dither: str | None) -> str:
+    normalized = "none" if dither is None else dither.lower()
+    if normalized not in DITHER_MODES:
+        allowed = ", ".join(sorted(DITHER_MODES))
+        raise ValueError(f"Unsupported dither mode: {dither}. Choose one of: {allowed}")
+    return normalized
+
+
+def _parse_hex_color(value: str) -> tuple[int, int, int]:
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+        raise ValueError(f"Invalid palette color '{value}'. Expected #RRGGBB.")
+    hex_value = value[1:] if value.startswith("#") else value
+    return (
+        int(hex_value[0:2], 16),
+        int(hex_value[2:4], 16),
+        int(hex_value[4:6], 16),
+    )
+
+
+def _resolve_palette(palette_colors: list[str] | None) -> list[tuple[int, int, int]]:
+    if palette_colors is None:
+        palette = list(DEFAULT_FILMIC_16_PALETTE)
+    else:
+        if len(palette_colors) != PALETTE_COLOR_COUNT:
+            raise ValueError(
+                f"Expected exactly {PALETTE_COLOR_COUNT} --palette-color values, got "
+                f"{len(palette_colors)}."
+            )
+        palette = [_parse_hex_color(color) for color in palette_colors]
+
+    if len(set(palette)) != PALETTE_COLOR_COUNT:
+        raise ValueError(f"Palette colors must be unique ({PALETTE_COLOR_COUNT} distinct colors).")
+
+    min_sq = PALETTE_MIN_DISTANCE * PALETTE_MIN_DISTANCE
+    for index, color_a in enumerate(palette):
+        for compare_index in range(index + 1, len(palette)):
+            color_b = palette[compare_index]
+            dr = color_a[0] - color_b[0]
+            dg = color_a[1] - color_b[1]
+            db = color_a[2] - color_b[2]
+            if dr * dr + dg * dg + db * db < min_sq:
+                raise ValueError(
+                    f"Palette colors at indexes {index} and {compare_index} are too similar. "
+                    f"Minimum RGB distance is {PALETTE_MIN_DISTANCE}."
+                )
+    return palette
+
+
+def _build_palette_image(palette: list[tuple[int, int, int]]) -> Image.Image:
+    palette_image = Image.new("P", (1, 1))
+    palette_values: list[int] = []
+    for red, green, blue in palette:
+        palette_values.extend([red, green, blue])
+    palette_values.extend([0] * (768 - len(palette_values)))
+    palette_image.putpalette(palette_values)
+    return palette_image
+
+
+def _apply_palette_dither(
+    image: Image.Image,
+    dither: str | None = None,
+    palette_colors: list[str] | None = None,
+) -> Image.Image:
+    normalized_dither = _normalize_dither(dither)
+    if normalized_dither == "none":
+        if palette_colors is not None:
+            raise ValueError("--palette-color requires --dither floyd-steinberg.")
+        return image
+
+    palette = _resolve_palette(palette_colors)
+    palette_image = _build_palette_image(palette)
+    rgb_image = image.convert("RGB")
+    return rgb_image.quantize(
+        colors=PALETTE_COLOR_COUNT,
+        palette=palette_image,
+        dither=Image.Dither.FLOYDSTEINBERG,
+    )
+
+
+def _normalize_workers(workers: int | None, mode: str, frame_count: int) -> int:
+    if workers is not None:
+        if workers <= 0:
+            raise ValueError("workers must be greater than 0")
+        return min(workers, frame_count)
+
+    if frame_count <= 1:
+        return 1
+
+    if mode != "flow" or frame_count < DEFAULT_AUTO_MIN_FRAMES:
+        return 1
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count, frame_count))
+
+
 def _intermediate_path(output_folder: Path, input_path: Path, output_format: str) -> Path:
     if output_format == "tiff":
         return output_folder / input_path.name
@@ -178,23 +318,146 @@ def _collect_source_images(
     )
 
 
+def _average_strip(image: Image.Image) -> Image.Image:
+    avg_color = average_image_color(image)
+    return Image.new("RGB", (image.width, 1), avg_color)
+
+
+def _flow_strip(image: Image.Image) -> Image.Image:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width, _ = rgb.shape
+    frame_max_channel = np.max(rgb.astype(np.float64), axis=2) / 255.0
+    frame_luminance = (
+        0.2126 * rgb[:, :, 0].astype(np.float64)
+        + 0.7152 * rgb[:, :, 1].astype(np.float64)
+        + 0.0722 * rgb[:, :, 2].astype(np.float64)
+    ) / 255.0
+    frame_near_black_ratio = float(
+        np.mean(
+            (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
+            & (frame_max_channel <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD)
+        )
+    )
+
+    quantized = rgb // FLOW_QUANTIZATION_SIZE
+    packed_bins = (
+        (quantized[:, :, 0].astype(np.uint16) << 8)
+        | (quantized[:, :, 1].astype(np.uint16) << 4)
+        | quantized[:, :, 2].astype(np.uint16)
+    )
+
+    row = np.zeros((width, 3), dtype=np.uint8)
+    denominator = float(height)
+
+    for x in range(width):
+        col_bins = packed_bins[:, x]
+        counts = np.bincount(col_bins, minlength=4096)
+        used = np.nonzero(counts)[0]
+        used_counts = counts[used].astype(np.float64)
+
+        col_r = rgb[:, x, 0].astype(np.float64)
+        col_g = rgb[:, x, 1].astype(np.float64)
+        col_b = rgb[:, x, 2].astype(np.float64)
+
+        sum_r = np.bincount(col_bins, weights=col_r, minlength=4096)[used]
+        sum_g = np.bincount(col_bins, weights=col_g, minlength=4096)[used]
+        sum_b = np.bincount(col_bins, weights=col_b, minlength=4096)[used]
+
+        centroid_r = np.rint(sum_r / used_counts).astype(np.uint8)
+        centroid_g = np.rint(sum_g / used_counts).astype(np.uint8)
+        centroid_b = np.rint(sum_b / used_counts).astype(np.uint8)
+
+        r_norm = centroid_r.astype(np.float64) / 255.0
+        g_norm = centroid_g.astype(np.float64) / 255.0
+        b_norm = centroid_b.astype(np.float64) / 255.0
+
+        maxc = np.maximum.reduce([r_norm, g_norm, b_norm])
+        minc = np.minimum.reduce([r_norm, g_norm, b_norm])
+        saturation = np.divide(
+            maxc - minc,
+            maxc,
+            out=np.zeros_like(maxc),
+            where=maxc != 0.0,
+        )
+        vibrance = saturation * maxc
+        luminance = 0.2126 * r_norm + 0.7152 * g_norm + 0.0722 * b_norm
+
+        freq = used_counts / denominator
+        score = freq * (
+            FLOW_BASE_COLOR_WEIGHT
+            + FLOW_VIBRANCE_WEIGHT * vibrance
+            + FLOW_LUMINANCE_WEIGHT * luminance
+        )
+        near_black_candidates = (luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD) & (
+            maxc <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD
+        )
+        score = np.where(
+            near_black_candidates & (freq >= FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+            score + FLOW_NEAR_BLACK_DOMINANCE_BOOST * freq,
+            score,
+        )
+        if frame_near_black_ratio < FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD:
+            score = np.where(
+                near_black_candidates & (freq < FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+                score * FLOW_NEAR_BLACK_PENALTY_MULTIPLIER,
+                score,
+            )
+
+        order = np.lexsort((used, -vibrance, -used_counts, -score))
+        best = order[0]
+        row[x, 0] = centroid_r[best]
+        row[x, 1] = centroid_g[best]
+        row[x, 2] = centroid_b[best]
+
+    return Image.fromarray(row[np.newaxis, :, :], mode="RGB")
+
+
+def _build_strip(image: Image.Image, mode: str) -> Image.Image:
+    if mode == "average":
+        return _average_strip(image)
+    return _flow_strip(image)
+
+
+def _build_strip_from_path(input_path: Path, mode: str) -> tuple[int, bytes]:
+    with Image.open(input_path) as image:
+        strip = _build_strip(image, mode)
+    return strip.size[0], strip.tobytes()
+
+
 def convert_to_strips(
     input_folder: Path,
     output_folder: Path,
     output_format: str = "tiff",
+    mode: str = "average",
+    workers: int | None = None,
 ) -> int:
     _validate_input_folder(input_folder)
     normalized_format = _normalize_output_format(output_format)
+    normalized_mode = _normalize_mode(mode)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     image_files = iter_image_files(input_folder)
     if not image_files:
         raise ValueError(f"No supported image files found in input folder: {input_folder}")
 
-    for input_path in image_files:
-        with Image.open(input_path) as image:
-            avg_color = average_image_color(image)
-            strip = Image.new("RGB", (image.width, 1), avg_color)
+    worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
+
+    if worker_count == 1:
+        for input_path in image_files:
+            with Image.open(input_path) as image:
+                strip = _build_strip(image, normalized_mode)
+                strip.save(_intermediate_path(output_folder, input_path, normalized_format))
+        return len(image_files)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_build_strip_from_path, input_path, normalized_mode): input_path
+            for input_path in image_files
+        }
+        for future in concurrent.futures.as_completed(futures):
+            input_path = futures[future]
+            width, data = future.result()
+            strip = Image.frombytes("RGB", (width, 1), data)
             strip.save(_intermediate_path(output_folder, input_path, normalized_format))
 
     return len(image_files)
@@ -205,6 +468,8 @@ def stack_tiff_images(
     output_file: Path,
     show_progress: bool = False,
     output_format: str | None = None,
+    dither: str | None = None,
+    palette_colors: list[str] | None = None,
 ) -> int:
     _validate_input_folder(input_folder)
 
@@ -233,6 +498,12 @@ def stack_tiff_images(
             stacked_image.paste(rgb_image, (0, current_height))
             current_height += rgb_image.size[1]
 
+    stacked_image = _apply_palette_dither(
+        stacked_image,
+        dither=dither,
+        palette_colors=palette_colors,
+    )
+
     if normalized_format == "png":
         stacked_image.save(output_file, format="PNG")
     else:
@@ -246,36 +517,71 @@ def build_timeline_from_frames(
     intermediate_dir: Path | None = None,
     show_progress: bool = False,
     output_format: str | None = None,
+    mode: str = "average",
+    workers: int | None = None,
+    dither: str | None = None,
+    palette_colors: list[str] | None = None,
 ) -> int:
     normalized_format = _normalize_output_format(output_format, output_file=output_file)
+    normalized_mode = _normalize_mode(mode)
     image_files, temp_dir_obj = _collect_source_images(input_folder)
 
     try:
         if intermediate_dir is not None:
             intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-        rows: list[tuple[int, tuple[int, int, int], Path]] = []
+        worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
+        rows: list[tuple[int, bytes]] = [(0, b"")] * len(image_files)
         max_width = 0
 
-        for path in _progress(image_files, show_progress, desc="Processing frames"):
-            with Image.open(path) as image:
-                avg_color = average_image_color(image)
-                width = image.size[0]
+        if worker_count == 1:
+            for row_index, path in enumerate(
+                _progress(image_files, show_progress, desc="Processing frames")
+            ):
+                with Image.open(path) as image:
+                    strip = _build_strip(image, normalized_mode)
+                width = strip.size[0]
+                data = strip.tobytes()
+                rows[row_index] = (width, data)
                 if width > max_width:
                     max_width = width
-
-            rows.append((width, avg_color, path))
-
-            if intermediate_dir is not None:
-                strip = Image.new("RGB", (width, 1), avg_color)
-                strip.save(_intermediate_path(intermediate_dir, path, normalized_format))
+                if intermediate_dir is not None:
+                    strip.save(_intermediate_path(intermediate_dir, path, normalized_format))
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(_build_strip_from_path, path, normalized_mode): (
+                        row_index,
+                        path,
+                    )
+                    for row_index, path in enumerate(image_files)
+                }
+                for future in _progress(
+                    concurrent.futures.as_completed(futures),
+                    show_progress,
+                    desc="Processing frames",
+                ):
+                    row_index, path = futures[future]
+                    width, data = future.result()
+                    rows[row_index] = (width, data)
+                    if width > max_width:
+                        max_width = width
+                    if intermediate_dir is not None:
+                        strip = Image.frombytes("RGB", (width, 1), data)
+                        strip.save(_intermediate_path(intermediate_dir, path, normalized_format))
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         timeline = Image.new("RGB", (max_width, len(rows)))
 
-        for row_index, (_, avg_color, _) in enumerate(rows):
-            row = Image.new("RGB", (max_width, 1), avg_color)
+        for row_index, (width, data) in enumerate(rows):
+            row = Image.frombytes("RGB", (width, 1), data)
             timeline.paste(row, (0, row_index))
+
+        timeline = _apply_palette_dither(
+            timeline,
+            dither=dither,
+            palette_colors=palette_colors,
+        )
 
         if normalized_format == "png":
             timeline.save(output_file, format="PNG")

@@ -12,6 +12,8 @@ from .core import (
 )
 
 OUTPUT_FORMAT_CHOICES = ("tiff", "png")
+MODE_CHOICES = ("average", "flow")
+DITHER_CHOICES = ("none", "floyd-steinberg")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="img-timeline",
         description="Create color timeline images from image-frame folders or video files.",
     )
-    parser.add_argument("--version", action="version", version="img-timeline 0.1.0")
+    parser.add_argument("--version", action="version", version="img-timeline 0.1.2")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -54,6 +56,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show progress bars (requires tqdm)",
     )
+    build_parser.add_argument(
+        "--mode",
+        choices=MODE_CHOICES,
+        default="average",
+        help="Row extraction mode: average (default) or flow.",
+    )
+    build_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of worker processes for frame processing "
+            "(flow mode auto-parallelizes when omitted)."
+        ),
+    )
+    build_parser.add_argument(
+        "--dither",
+        choices=DITHER_CHOICES,
+        default="none",
+        help="Apply dithering to final output image.",
+    )
+    build_parser.add_argument(
+        "--palette-color",
+        action="append",
+        default=None,
+        help="Repeat exactly 16 times with #RRGGBB to provide a custom dither palette.",
+    )
 
     convert_parser = subparsers.add_parser(
         "convert",
@@ -74,6 +103,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=OUTPUT_FORMAT_CHOICES,
         default="tiff",
         help="Output image format for strips (default: tiff)",
+    )
+    convert_parser.add_argument(
+        "--mode",
+        choices=MODE_CHOICES,
+        default="average",
+        help="Strip generation mode: average (default) or flow.",
+    )
+    convert_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of worker processes for strip generation "
+            "(flow mode auto-parallelizes when omitted)."
+        ),
     )
 
     stack_parser = subparsers.add_parser(
@@ -100,6 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--progress",
         action="store_true",
         help="Show progress bars (requires tqdm)",
+    )
+    stack_parser.add_argument(
+        "--dither",
+        choices=DITHER_CHOICES,
+        default="none",
+        help="Apply dithering to final output image.",
+    )
+    stack_parser.add_argument(
+        "--palette-color",
+        action="append",
+        default=None,
+        help="Repeat exactly 16 times with #RRGGBB to provide a custom dither palette.",
     )
 
     demo_parser = subparsers.add_parser(
@@ -133,6 +189,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             intermediate_dir=args.intermediate_dir,
             show_progress=args.progress,
             output_format=args.output_format,
+            mode=args.mode,
+            workers=args.workers,
+            dither=args.dither,
+            palette_colors=args.palette_color,
         )
         print(f"Processed {count} frame(s) into {args.output_file}")
         return 0
@@ -142,6 +202,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.input_folder,
             args.output_folder,
             output_format=args.output_format,
+            mode=args.mode,
+            workers=args.workers,
         )
         print(f"Processed {count} image file(s) into {args.output_folder}")
         return 0
@@ -152,6 +214,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.output_file,
             show_progress=args.progress,
             output_format=args.output_format,
+            dither=args.dither,
+            palette_colors=args.palette_color,
         )
         print(f"Stacked {count} image file(s) into {args.output_file}")
         return 0
