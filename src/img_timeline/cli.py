@@ -12,10 +12,13 @@ from .core import (
 )
 
 
+OUTPUT_FORMAT_CHOICES = ("tiff", "png")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="img-timeline",
-        description="Create color timeline images from TIFF frame sequences.",
+        description="Create color timeline images from image-frame folders or video files.",
     )
     parser.add_argument("--version", action="version", version="img-timeline 0.1.0")
 
@@ -23,19 +26,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_parser = subparsers.add_parser(
         "build",
-        help="Build a timeline directly from source frames.",
+        help="Build a timeline directly from source frames or a video file.",
     )
     build_parser.add_argument(
-        "input_folder",
+        "input_path",
         type=Path,
-        help="Directory containing source TIFF frames",
+        help="Directory of source frames, or a supported video file (e.g. .mp4)",
     )
-    build_parser.add_argument("output_file", type=Path, help="Output TIFF timeline path")
+    build_parser.add_argument(
+        "output_file",
+        type=Path,
+        help="Output timeline path (.tif/.tiff for TIFF or .png for PNG)",
+    )
     build_parser.add_argument(
         "--intermediate-dir",
         type=Path,
         default=None,
-        help="Optional directory to write intermediate 1px TIFF strips",
+        help="Optional directory to write intermediate 1px strips",
+    )
+    build_parser.add_argument(
+        "--output-format",
+        choices=OUTPUT_FORMAT_CHOICES,
+        default=None,
+        help="Output image format. Defaults to TIFF unless output file ends with .png.",
     )
     build_parser.add_argument(
         "--progress",
@@ -50,12 +63,18 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "input_folder",
         type=Path,
-        help="Directory containing source TIFF files",
+        help="Directory containing source image files",
     )
     convert_parser.add_argument(
         "output_folder",
         type=Path,
-        help="Directory where 1px TIFF files are written",
+        help="Directory where 1px strip files are written",
+    )
+    convert_parser.add_argument(
+        "--output-format",
+        choices=OUTPUT_FORMAT_CHOICES,
+        default="tiff",
+        help="Output image format for strips (default: tiff)",
     )
 
     stack_parser = subparsers.add_parser(
@@ -65,9 +84,19 @@ def build_parser() -> argparse.ArgumentParser:
     stack_parser.add_argument(
         "input_folder",
         type=Path,
-        help="Directory containing TIFF files to stack",
+        help="Directory containing image strips to stack",
     )
-    stack_parser.add_argument("output_file", type=Path, help="Output TIFF file path")
+    stack_parser.add_argument(
+        "output_file",
+        type=Path,
+        help="Output timeline path (.tif/.tiff for TIFF or .png for PNG)",
+    )
+    stack_parser.add_argument(
+        "--output-format",
+        choices=OUTPUT_FORMAT_CHOICES,
+        default=None,
+        help="Output image format. Defaults to TIFF unless output file ends with .png.",
+    )
     stack_parser.add_argument(
         "--progress",
         action="store_true",
@@ -100,22 +129,32 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args.command == "build":
         count = build_timeline_from_frames(
-            args.input_folder,
+            args.input_path,
             args.output_file,
             intermediate_dir=args.intermediate_dir,
             show_progress=args.progress,
+            output_format=args.output_format,
         )
-        print(f"Processed {count} TIFF frame(s) into {args.output_file}")
+        print(f"Processed {count} frame(s) into {args.output_file}")
         return 0
 
     if args.command == "convert":
-        count = convert_to_strips(args.input_folder, args.output_folder)
-        print(f"Processed {count} TIFF file(s) into {args.output_folder}")
+        count = convert_to_strips(
+            args.input_folder,
+            args.output_folder,
+            output_format=args.output_format,
+        )
+        print(f"Processed {count} image file(s) into {args.output_folder}")
         return 0
 
     if args.command == "stack":
-        count = stack_tiff_images(args.input_folder, args.output_file, show_progress=args.progress)
-        print(f"Stacked {count} TIFF file(s) into {args.output_file}")
+        count = stack_tiff_images(
+            args.input_folder,
+            args.output_file,
+            show_progress=args.progress,
+            output_format=args.output_format,
+        )
+        print(f"Stacked {count} image file(s) into {args.output_file}")
         return 0
 
     if args.command == "generate-demo":

@@ -6,7 +6,7 @@ Create a color timeline from every frame of an exported movie.
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 
-`img-timeline` is a movie color analysis tool that reads a TIFF frame sequence, computes the average color per frame, and writes a timeline image with one row per frame.  
+`img-timeline` is a movie color analysis tool that reads image frame sequences (TIFF, PNG, JPEG, WebP, BMP, GIF) or supported video files (MP4/MOV/MKV/AVI/WebM and more), computes the average color per frame, and writes a timeline image with one row per frame.  
 Stretch that timeline vertically in an editor and you get an average color film poster: a compact infographic of the movie's color palette progression over time.
 
 ## Sample Output
@@ -62,7 +62,7 @@ pip install movie-color-timeline
 
 ## Quickstart (60 seconds)
 
-1. Put movie frames (`.tif` / `.tiff`) in a folder, e.g. `./frames`.
+1. Put movie frames (for example `.tif`, `.png`, `.jpg`) in a folder, e.g. `./frames` or pass a video file directly.
 2. Run:
 
 ```bash
@@ -80,11 +80,12 @@ mkdir -p ./frames
 ffmpeg -i ./movie.mp4 -vsync 0 ./frames/%06d.tif
 ```
 
-### 2) Build a timeline in one command
+### 2) Build a timeline in one command (from frames or directly from a movie)
 
 ```bash
 mkdir -p ./out
 img-timeline build ./frames ./out/movie_timeline.tif --progress
+img-timeline build ./movie.mp4 ./out/movie_timeline.png --output-format png --progress
 ```
 
 ### 3) Keep intermediate strips for inspection
@@ -122,7 +123,7 @@ Use `-filter point` to preserve hard row boundaries without blending.
 
 | Command | Purpose | Example |
 |---|---|---|
-| `img-timeline build <input_folder> <output_file>` | Full pipeline from source frames to final timeline | `img-timeline build ./frames ./out/timeline.tif` |
+| `img-timeline build <input_path> <output_file>` | Full pipeline from source frames/video to final timeline | `img-timeline build ./frames ./out/timeline.tif` |
 | `img-timeline convert <input_folder> <output_folder>` | Convert each frame to a 1px strip of its average color | `img-timeline convert ./frames ./out/strips` |
 | `img-timeline stack <input_folder> <output_file>` | Stack strips into final timeline | `img-timeline stack ./out/strips ./out/timeline.tif` |
 | `img-timeline generate-demo <output_dir>` | Create synthetic rainbow TIFF frames for testing | `img-timeline generate-demo ./demo_frames --count 500 --size 2` |
@@ -130,7 +131,8 @@ Use `-filter point` to preserve hard row boundaries without blending.
 ### Useful flags
 
 - `--progress`: show progress bars (requires `tqdm`)
-- `--intermediate-dir <dir>` (for `build`): also write 1px strip TIFFs
+- `--intermediate-dir <dir>` (for `build`): also write 1px strip images (TIFF/PNG based on output format)
+- `--output-format {tiff,png}` (for `build`, `convert`, `stack`): choose output encoding. Default is TIFF unless output filename ends with `.png`.
 
 ## How output is computed
 
@@ -167,8 +169,10 @@ Use zero-padded names so lexical sort matches frame order:
 
 ## Troubleshooting
 
-- `FileNotFoundError`: input folder path is wrong or not a directory.
-- `ValueError: No TIFF files found`: input directory has no `.tif` / `.tiff`.
+- `FileNotFoundError`: input path is wrong.
+- `ValueError: No supported image files found`: input directory has no supported image files.
+- `ValueError: Output file extension must be ...`: use `.tif`/`.tiff`/`.png`, or provide `--output-format`.
+- `RuntimeError: ffmpeg is required`: install ffmpeg or provide a directory of image frames.
 - If `pip install -e .` fails with an externally-managed Python error, install inside a virtual environment (see Install section).
 
 ## License

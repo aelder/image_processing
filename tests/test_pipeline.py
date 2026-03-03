@@ -62,11 +62,7 @@ class TestImagePipeline(unittest.TestCase):
             count = build_timeline_from_frames(source_dir, output_file, intermediate_dir=inter_dir)
             self.assertEqual(count, 2)
 
-            strips = sorted(
-                path.name
-                for path in inter_dir.iterdir()
-                if path.suffix.lower() in {".tif", ".tiff"}
-            )
+            strips = sorted(path.name for path in inter_dir.iterdir() if path.is_file())
             self.assertEqual(strips, ["a.tif", "b.tiff"])
 
             with Image.open(inter_dir / "a.tif") as strip_a:
@@ -127,6 +123,61 @@ class TestImagePipeline(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_timeline_from_frames(empty_dir, Path(temp_dir) / "out.tif")
 
+    def test_accepts_common_image_formats(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            output_file = root / "timeline.tif"
+            source_dir.mkdir(parents=True)
+
+            Image.new("RGB", (2, 2), (10, 20, 30)).save(source_dir / "001.png")
+            Image.new("RGB", (2, 2), (40, 50, 60)).save(source_dir / "002.bmp")
+
+            count = build_timeline_from_frames(source_dir, output_file)
+            self.assertEqual(count, 2)
+
+            with Image.open(output_file) as timeline:
+                self.assertEqual(timeline.size, (2, 2))
+                px = timeline.load()
+                self.assertEqual(px[0, 0], (10, 20, 30))
+                self.assertEqual(px[0, 1], (40, 50, 60))
+
+    def test_png_output_mode(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            output_file = root / "timeline.png"
+            inter_dir = root / "intermediate"
+            source_dir.mkdir(parents=True)
+
+            Image.new("RGB", (2, 2), (255, 0, 0)).save(source_dir / "a.tif")
+            Image.new("RGB", (2, 2), (0, 255, 0)).save(source_dir / "b.tif")
+
+            count = build_timeline_from_frames(
+                source_dir,
+                output_file,
+                intermediate_dir=inter_dir,
+                output_format="png",
+            )
+            self.assertEqual(count, 2)
+            self.assertTrue(output_file.exists())
+
+            with Image.open(output_file) as timeline:
+                self.assertEqual(timeline.format, "PNG")
+
+            strips = sorted(path.name for path in inter_dir.iterdir() if path.is_file())
+            self.assertEqual(strips, ["a.png", "b.png"])
+
+    def test_invalid_output_extension_requires_explicit_format(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            source_dir.mkdir(parents=True)
+            Image.new("RGB", (2, 2), (255, 0, 0)).save(source_dir / "a.tif")
+
+            with self.assertRaises(ValueError):
+                build_timeline_from_frames(source_dir, root / "timeline.jpg")
+
     def test_non_rgb_input_handling(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -172,7 +223,7 @@ class TestImagePipeline(unittest.TestCase):
                 text=True,
                 env=env,
             )
-            self.assertIn("Processed 2 TIFF frame(s)", proc.stdout)
+            self.assertIn("Processed 2 frame(s)", proc.stdout)
             self.assertTrue(output_file.exists())
 
 

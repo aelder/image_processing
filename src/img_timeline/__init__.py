@@ -5,11 +5,13 @@ from .core import (
     build_timeline_from_frames,
     convert_to_strips,
     generate_rainbow_tiffs,
+    iter_image_files,
     iter_tiff_files,
     stack_tiff_images,
 )
 
 __all__ = [
+    "iter_image_files",
     "iter_tiff_files",
     "average_image_color",
     "convert_to_strips",
