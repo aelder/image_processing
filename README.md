@@ -6,8 +6,8 @@ Create a color timeline from every frame of an exported movie.
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-`img-timeline` reads a TIFF frame sequence, computes the average color per frame, and writes a timeline image with one row per frame.  
-Stretch that timeline vertically in an editor and you get an average-color poster of the entire film: a clean visual infographic of palette over time.
+`img-timeline` is a movie color analysis tool that reads a TIFF frame sequence, computes the average color per frame, and writes a timeline image with one row per frame.  
+Stretch that timeline vertically in an editor and you get an average color film poster: a compact infographic of the movie's color palette progression over time.
 
 ## Sample Output
 
