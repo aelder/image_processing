@@ -29,18 +29,35 @@ img-timeline build ./rainbow ./rainbow_timeline.tif
 
 ## Install
 
-### Recommended (virtual environment)
+### From source (current method)
+
+First, download the repository:
+
+```bash
+git clone https://github.com/aelder/image_processing.git
+cd image_processing
+```
+
+Then install in a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .[progress]
+pip install -e ".[progress]"
 ```
 
 ### Command installed
 
 ```bash
 img-timeline
+```
+
+### Planned PyPI install
+
+Once published to PyPI, install without cloning:
+
+```bash
+pip install movie-color-timeline
 ```
 
 ## Quickstart (60 seconds)
