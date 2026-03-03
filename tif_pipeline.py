@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-from pipeline_core import build_timeline_from_frames
+_ROOT = Path(__file__).resolve().parent
+_SRC = _ROOT / "src"
+if _SRC.exists() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from img_timeline.core import build_timeline_from_frames  # noqa: E402
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

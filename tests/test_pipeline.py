@@ -1,10 +1,22 @@
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from PIL import Image
 
-from pipeline_core import build_timeline_from_frames, convert_to_strips, stack_tiff_images
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from img_timeline.core import (  # noqa: E402
+    build_timeline_from_frames,
+    convert_to_strips,
+    stack_tiff_images,
+)
 
 
 class TestImagePipeline(unittest.TestCase):
@@ -50,7 +62,11 @@ class TestImagePipeline(unittest.TestCase):
             count = build_timeline_from_frames(source_dir, output_file, intermediate_dir=inter_dir)
             self.assertEqual(count, 2)
 
-            strips = sorted(path.name for path in inter_dir.iterdir() if path.suffix.lower() in {".tif", ".tiff"})
+            strips = sorted(
+                path.name
+                for path in inter_dir.iterdir()
+                if path.suffix.lower() in {".tif", ".tiff"}
+            )
             self.assertEqual(strips, ["a.tif", "b.tiff"])
 
             with Image.open(inter_dir / "a.tif") as strip_a:
@@ -118,7 +134,6 @@ class TestImagePipeline(unittest.TestCase):
             output_file = root / "timeline.tif"
             source_dir.mkdir(parents=True)
 
-            # grayscale and RGBA inputs should both be normalized to RGB safely
             Image.new("L", (2, 2), 128).save(source_dir / "a.tif")
             Image.new("RGBA", (2, 2), (10, 20, 30, 255)).save(source_dir / "b.tif")
 
@@ -130,6 +145,35 @@ class TestImagePipeline(unittest.TestCase):
                 px = timeline.load()
                 self.assertEqual(px[0, 0], (128, 128, 128))
                 self.assertEqual(px[0, 1], (10, 20, 30))
+
+    def test_package_cli_build(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            output_file = root / "out" / "timeline.tif"
+            source_dir.mkdir(parents=True)
+
+            Image.new("RGB", (2, 2), (255, 0, 0)).save(source_dir / "001.tif")
+            Image.new("RGB", (2, 2), (0, 255, 0)).save(source_dir / "002.tif")
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(SRC)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "img_timeline",
+                    "build",
+                    str(source_dir),
+                    str(output_file),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertIn("Processed 2 TIFF frame(s)", proc.stdout)
+            self.assertTrue(output_file.exists())
 
 
 if __name__ == "__main__":

@@ -1,81 +1,65 @@
-# TIFF Color Timeline Tool
+# img-timeline Usage
 
-This project turns a folder of TIFF frames into a single timeline image where each row represents one frame's average color.
+`img-timeline` is an installable CLI for turning TIFF frame sequences into average-color timeline images.
 
-## What it does
-
-- Reads source `.tif` / `.tiff` files from an input folder.
-- Sorts files lexically by filename for deterministic ordering.
-- Computes the average RGB color of each frame.
-- Builds a final timeline TIFF where:
-  - width = maximum frame width in the input set
-  - height = number of input frames
-  - each output row = average color of one input frame
-
-## Main command (recommended)
-
-Use the unified pipeline command:
+## Install
 
 ```bash
-python3 tif_pipeline.py <input_folder> <output_file>
+pip install -e .
 ```
 
-Example:
+## Commands
+
+### 1) Build timeline (single-step)
 
 ```bash
-python3 tif_pipeline.py ./frames ./out/timeline.tif
+img-timeline build <input_folder> <output_file>
 ```
 
-### Optional flags
+Options:
+- `--intermediate-dir <dir>`: also write 1px strip TIFFs.
+- `--progress`: show progress bars (requires `tqdm`).
 
-- `--intermediate-dir <dir>`
-  - Also writes 1-pixel-high TIFF strips for each frame.
-- `--progress`
-  - Shows progress bars (requires `tqdm` installed).
-
-Example with both options:
+### 2) Convert to strips (legacy step)
 
 ```bash
-python3 tif_pipeline.py ./frames ./out/timeline.tif --intermediate-dir ./out/strips --progress
+img-timeline convert <input_folder> <output_folder>
 ```
 
-## Legacy two-step commands (still supported)
-
-Step 1: Convert frames to 1px strips:
+### 3) Stack strips (legacy step)
 
 ```bash
-python3 tif_convert.py <input_folder> <output_folder>
+img-timeline stack <input_folder> <output_file> [--progress]
 ```
 
-Step 2: Stack strips into timeline:
+### 4) Generate demo rainbow frames
 
 ```bash
-python3 tif_stacker.py <input_folder> <output_file> [--progress]
+img-timeline generate-demo <output_dir> [--count 500] [--size 2]
 ```
 
-## Requirements
-
-- Python 3.10+
-- Pillow
-
-Install dependencies:
+## Typical workflow
 
 ```bash
-pip install pillow
+img-timeline build ./frames ./out/timeline.tif --progress
 ```
 
-Optional progress bars:
+## Legacy script wrappers
 
-```bash
-pip install tqdm
-```
+These still work for compatibility:
+
+- `python3 tif_pipeline.py ...`
+- `python3 tif_convert.py ...`
+- `python3 tif_stacker.py ...`
+- `python3 generate_rainbow_tiffs.py ...`
 
 ## Error behavior
 
 - Raises `FileNotFoundError` if input folder does not exist or is not a directory.
 - Raises `ValueError` if no TIFF files are found in the input folder.
 
-## Notes
+## Output semantics
 
-- Output is always RGB TIFF.
-- Ordering is by sorted filename; make sure filenames reflect frame order.
+- Output format is RGB TIFF.
+- Ordering is sorted lexical filename order.
+- Timeline output has one row per source frame.

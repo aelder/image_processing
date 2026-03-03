@@ -1,36 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import colorsys
+import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-from PIL import Image
+_ROOT = Path(__file__).resolve().parent
+_SRC = _ROOT / "src"
+if _SRC.exists() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-
-def generate_rainbow_tiffs(output_dir: Path, count: int = 500, size: int = 2) -> int:
-    if count <= 0:
-        raise ValueError("count must be greater than 0")
-    if size <= 0:
-        raise ValueError("size must be greater than 0")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pad = max(3, len(str(count - 1)))
-
-    for index in range(count):
-        hue = index / count
-        r_float, g_float, b_float = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-        color = (
-            int(round(r_float * 255)),
-            int(round(g_float * 255)),
-            int(round(b_float * 255)),
-        )
-
-        image = Image.new("RGB", (size, size), color)
-        filename = f"{index:0{pad}d}.tif"
-        image.save(output_dir / filename)
-
-    return count
+from img_timeline.core import generate_rainbow_tiffs  # noqa: E402
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

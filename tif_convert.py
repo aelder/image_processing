@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-from pipeline_core import convert_to_strips
+_ROOT = Path(__file__).resolve().parent
+_SRC = _ROOT / "src"
+if _SRC.exists() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from img_timeline.core import convert_to_strips  # noqa: E402
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -15,7 +21,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("input_folder", type=Path, help="Directory containing source TIFF files")
-    parser.add_argument("output_folder", type=Path, help="Directory where 1px TIFF files are written")
+    parser.add_argument(
+        "output_folder",
+        type=Path,
+        help="Directory where 1px TIFF files are written",
+    )
     return parser.parse_args(argv)
 
 

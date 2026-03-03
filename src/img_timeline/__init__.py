@@ -1,15 +1,6 @@
-from __future__ import annotations
+"""img_timeline package."""
 
-import sys
-from pathlib import Path
-
-# Local editable compatibility: allow imports without installation.
-_ROOT = Path(__file__).resolve().parent
-_SRC = _ROOT / "src"
-if _SRC.exists() and str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-
-from img_timeline.core import (  # noqa: E402
+from .core import (
     average_image_color,
     build_timeline_from_frames,
     convert_to_strips,
