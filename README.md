@@ -4,7 +4,7 @@ Create a color timeline from every frame of an exported movie.
 
 ![CI](https://github.com/aelder/image_processing/actions/workflows/ci.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-GPLv3-green)
 
 `img-timeline` is a movie color analysis tool that reads a TIFF frame sequence, computes the average color per frame, and writes a timeline image with one row per frame.  
 Stretch that timeline vertically in an editor and you get an average color film poster: a compact infographic of the movie's color palette progression over time.
@@ -156,4 +156,4 @@ Use zero-padded names so lexical sort matches frame order:
 
 ## License
 
-MIT-style usage as provided in [`LICENSE`](./LICENSE).
+Licensed under GNU GPL v3.0 as provided in [`LICENSE`](./LICENSE).
