@@ -1,4 +1,8 @@
-Convert a TIFF image sequence into a vertical color timeline.
+Create a color-based timeline from every frame of an exported movie.
+
+This tool takes a TIFF frame sequence (for example, frames exported from a film), calculates the average color of each frame, and stacks those colors in order to produce a timeline image. The result is a compact color summary of the full movie.
+
+If you stretch the 1px-per-frame timeline in an image editor, you can turn it into an average-color poster of the entire film: a color infographic that shows the movie's palette progression over time.
 
 ## Preferred workflow (single command)
 
