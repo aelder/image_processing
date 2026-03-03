@@ -1,34 +1,32 @@
-from PIL import Image
-import os
-from tqdm import tqdm
+from __future__ import annotations
 
-def stack_tiff_images(input_folder, output_file):
-    tiff_files = [f for f in os.listdir(input_folder) if f.lower().endswith(".tif")]
+import argparse
+from pathlib import Path
+from typing import Iterable
 
-    images = []
-    total_height = 0
-    max_width = 0
+from pipeline_core import stack_tiff_images
 
-    for file_name in tqdm(tiff_files, desc="Loading images"):
-        file_path = os.path.join(input_folder, file_name)
-        with Image.open(file_path) as image:
-            images.append(image.copy())
 
-            width, height = image.size
-            total_height += height
-            max_width = max(max_width, width)
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Vertically stack TIFF files in lexical filename order."
+    )
+    parser.add_argument("input_folder", type=Path, help="Directory containing TIFF files to stack")
+    parser.add_argument("output_file", type=Path, help="Output TIFF file path")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show progress bars (requires tqdm)",
+    )
+    return parser.parse_args(argv)
 
-    stacked_image = Image.new("RGB", (max_width, total_height))
-    current_height = 0
 
-    for image in tqdm(images, desc="Stacking images"):
-        stacked_image.paste(image, (0, current_height))
-        current_height += image.size[1]
-        image.close()
+def main(argv: Iterable[str] | None = None) -> int:
+    args = parse_args(argv)
+    count = stack_tiff_images(args.input_folder, args.output_file, show_progress=args.progress)
+    print(f"Stacked {count} TIFF file(s) into {args.output_file}")
+    return 0
 
-    stacked_image.save(output_file)
 
-input_folder = "\input"
-output_file = "\stacked_output.tif"
-
-stack_tiff_images(input_folder, output_file)
+if __name__ == "__main__":
+    raise SystemExit(main())
