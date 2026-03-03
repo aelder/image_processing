@@ -11,7 +11,6 @@ from .core import (
     stack_tiff_images,
 )
 
-
 OUTPUT_FORMAT_CHOICES = ("tiff", "png")
 
 

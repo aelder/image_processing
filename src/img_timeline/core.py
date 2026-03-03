@@ -83,7 +83,8 @@ def _normalize_output_format(output_format: str | None, output_file: Path | None
             if suffix in {"", ".tif", ".tiff"}:
                 return "tiff"
             raise ValueError(
-                "Output file extension must be .tif/.tiff or .png unless --output-format is provided."
+                "Output file extension must be .tif/.tiff or .png unless "
+                "--output-format is provided."
             )
         return "tiff"
 
@@ -121,7 +122,8 @@ def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
-            "ffmpeg is required to process video files. Install ffmpeg or provide a directory of image frames."
+            "ffmpeg is required to process video files. Install ffmpeg or "
+            "provide a directory of image frames."
         )
 
     output_pattern = frame_dir / "%09d.png"
@@ -146,7 +148,9 @@ def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
         raise RuntimeError(f"Failed to extract frames from video '{video_file}': {error_details}")
 
 
-def _collect_source_images(input_path: Path) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
+def _collect_source_images(
+    input_path: Path,
+) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
     if input_path.is_dir():
         image_files = iter_image_files(input_path)
         if not image_files:
