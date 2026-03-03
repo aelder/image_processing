@@ -20,11 +20,11 @@ img-timeline build ./red.mkv ./out/red_flow_dithered_20260303_154840.png --mode 
 
 Flow timeline (non-dithered):
 
-![Red Balloon flow timeline](./out/red_flow.png)
+![Red Balloon flow timeline](./assets/red_balloon_flow.png)
 
 16-color Floyd-Steinberg dithered timeline:
 
-![Red Balloon dithered timeline](./out/red_flow_dithered_20260303_154840.png)
+![Red Balloon dithered timeline](./assets/red_balloon_flow_dithered.png)
 
 ## Why this tool
 
