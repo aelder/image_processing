@@ -3,10 +3,12 @@ from __future__ import annotations
 import colorsys
 import concurrent.futures
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -14,6 +16,11 @@ from typing import BinaryIO
 
 import numpy as np
 from PIL import Image, ImageStat
+
+try:
+    import cupy as cp
+except ImportError:  # pragma: no cover
+    cp = None
 
 try:
     from tqdm import tqdm
@@ -72,6 +79,39 @@ FLOW_NEAR_BLACK_DOMINANCE_BOOST = 0.20
 DEFAULT_AUTO_MIN_FRAMES = 8
 VIDEO_POLL_INTERVAL_SECONDS = 0.05
 VIDEO_INFLIGHT_MULTIPLIER = 2
+FLOW_BIN_COUNT = 4096
+FLOW_CUDA_BATCH_SIZE = 4
+
+_FLOW_CUDA_CACHE: dict[tuple[int, int], dict[str, cp.ndarray]] = {}
+_FLOW_CUDA_HISTOGRAM_KERNEL = None
+_FLOW_CUDA_HISTOGRAM_KERNEL_SOURCE = r"""
+extern "C" __global__
+void flow_histogram_kernel(
+    const unsigned char* rgb,
+    const int* packed_bins,
+    const int width,
+    const int pixel_count,
+    int* counts,
+    float* sum_r,
+    float* sum_g,
+    float* sum_b
+) {
+    int idx = (blockDim.x * blockIdx.x) + threadIdx.x;
+    if (idx >= pixel_count) {
+        return;
+    }
+
+    int col = idx % width;
+    int bin = packed_bins[idx];
+    int offset = (col * 4096) + bin;
+    int rgb_offset = idx * 3;
+
+    atomicAdd(&counts[offset], 1);
+    atomicAdd(&sum_r[offset], (float)rgb[rgb_offset]);
+    atomicAdd(&sum_g[offset], (float)rgb[rgb_offset + 1]);
+    atomicAdd(&sum_b[offset], (float)rgb[rgb_offset + 2]);
+}
+"""
 
 
 def iter_image_files(input_folder: Path) -> list[Path]:
@@ -252,6 +292,27 @@ def _normalize_workers(workers: int | None, mode: str, frame_count: int) -> int:
     return max(1, min(cpu_count, frame_count))
 
 
+def _normalize_cuda(use_cuda: bool, mode: str) -> bool:
+    if not use_cuda:
+        return False
+    if mode != "flow":
+        return False
+    return True
+
+
+def _normalize_flow_worker_count(
+    workers: int | None,
+    mode: str,
+    frame_count: int,
+    use_cuda: bool,
+) -> int:
+    worker_count = _normalize_workers(workers, mode, frame_count)
+    if _normalize_cuda(use_cuda, mode):
+        # Keep a single CUDA context in-process to avoid GPU contention across child processes.
+        return 1
+    return worker_count
+
+
 def _intermediate_path(output_folder: Path, input_path: Path, output_format: str) -> Path:
     if output_format == "tiff":
         return output_folder / input_path.name
@@ -262,7 +323,7 @@ def _is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_VIDEO_SUFFIXES
 
 
-def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
+def _extract_video_frames(video_file: Path, frame_dir: Path, use_cuda: bool = False) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
@@ -271,18 +332,28 @@ def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
         )
 
     output_pattern = frame_dir / "%09d.png"
-    result = subprocess.run(
+    command: list[str] = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if use_cuda:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+    command.extend(
         [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-i",
             str(video_file),
             "-vsync",
             "0",
-            str(output_pattern),
-        ],
+        ]
+    )
+    if use_cuda:
+        command.extend(["-vf", "hwdownload,format=rgb24"])
+    command.append(str(output_pattern))
+
+    result = subprocess.run(
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -292,7 +363,11 @@ def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
         raise RuntimeError(f"Failed to extract frames from video '{video_file}': {error_details}")
 
 
-def _start_video_frame_extractor(video_file: Path, frame_dir: Path) -> subprocess.Popen[str]:
+def _start_video_frame_extractor(
+    video_file: Path,
+    frame_dir: Path,
+    use_cuda: bool = False,
+) -> subprocess.Popen[str]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
@@ -301,18 +376,28 @@ def _start_video_frame_extractor(video_file: Path, frame_dir: Path) -> subproces
         )
 
     output_pattern = frame_dir / "%09d.png"
-    return subprocess.Popen(
+    command: list[str] = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if use_cuda:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+    command.extend(
         [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-i",
             str(video_file),
             "-vsync",
             "0",
-            str(output_pattern),
-        ],
+        ]
+    )
+    if use_cuda:
+        command.extend(["-vf", "hwdownload,format=rgb24"])
+    command.append(str(output_pattern))
+
+    return subprocess.Popen(
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -368,7 +453,7 @@ def _probe_video_dimensions(video_file: Path) -> tuple[int, int]:
     return _parse_video_dimensions(result.stdout, video_file)
 
 
-def _start_video_raw_extractor(video_file: Path) -> subprocess.Popen[bytes]:
+def _start_video_raw_extractor(video_file: Path, use_cuda: bool = False) -> subprocess.Popen[bytes]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
@@ -376,22 +461,36 @@ def _start_video_raw_extractor(video_file: Path) -> subprocess.Popen[bytes]:
             "provide a directory of image frames."
         )
 
-    return subprocess.Popen(
+    command: list[str] = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if use_cuda:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+    command.extend(
         [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-i",
             str(video_file),
             "-vsync",
             "0",
+        ]
+    )
+    if use_cuda:
+        command.extend(["-vf", "hwdownload,format=rgb24"])
+    command.extend(
+        [
             "-f",
             "rawvideo",
             "-pix_fmt",
             "rgb24",
             "pipe:1",
-        ],
+        ]
+    )
+
+    return subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -416,12 +515,15 @@ def _read_raw_video_frame(stream: BinaryIO, frame_byte_count: int) -> bytes | No
     return frame
 
 
-def _normalize_video_workers(workers: int | None, mode: str) -> int:
+def _normalize_video_workers(workers: int | None, mode: str, use_cuda: bool = False) -> int:
     if workers is not None:
         if workers <= 0:
             raise ValueError("workers must be greater than 0")
         return workers
     if mode != "flow":
+        return 1
+    if _normalize_cuda(use_cuda, mode):
+        # Single process avoids multiple CUDA contexts contending for one device.
         return 1
     return max(1, os.cpu_count() or 1)
 
@@ -447,12 +549,14 @@ def _process_video_frames_streaming_disk(
     show_progress: bool,
     intermediate_dir: Path | None,
     output_format: str,
+    use_cuda_compute: bool = False,
+    use_cuda_decode: bool = False,
 ) -> tuple[list[tuple[int, bytes]], int]:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temp_dir_obj = tempfile.TemporaryDirectory(dir=str(output_file.parent))
     temp_dir = Path(temp_dir_obj.name)
-    extractor = _start_video_frame_extractor(input_video, temp_dir)
-    worker_count = _normalize_video_workers(workers, mode)
+    extractor = _start_video_frame_extractor(input_video, temp_dir, use_cuda=use_cuda_decode)
+    worker_count = _normalize_video_workers(workers, mode, use_cuda=use_cuda_compute)
     max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
     rows: list[tuple[int, bytes] | None] = []
     max_width = 0
@@ -467,7 +571,11 @@ def _process_video_frames_streaming_disk(
                 if _video_frame_ready(temp_dir, next_frame_number, extractor_done):
                     frame_path = _video_frame_path(temp_dir, next_frame_number)
                     row_index = next_frame_number - 1
-                    width, data = _build_strip_from_path(frame_path, mode)
+                    width, data = _build_strip_from_path(
+                        frame_path,
+                        mode,
+                        use_cuda=use_cuda_compute,
+                    )
                     while len(rows) <= row_index:
                         rows.append(None)
                     rows[row_index] = (width, data)
@@ -494,7 +602,12 @@ def _process_video_frames_streaming_disk(
                     ):
                         frame_path = _video_frame_path(temp_dir, next_frame_number)
                         row_index = next_frame_number - 1
-                        future = executor.submit(_build_strip_from_path, frame_path, mode)
+                        future = executor.submit(
+                            _build_strip_from_path,
+                            frame_path,
+                            mode,
+                            use_cuda_compute,
+                        )
                         inflight[future] = (row_index, frame_path)
                         next_frame_number += 1
 
@@ -561,9 +674,10 @@ def _build_strip_from_frame_bytes(
     width: int,
     height: int,
     mode: str,
+    use_cuda: bool = False,
 ) -> tuple[int, bytes]:
     image = Image.frombytes("RGB", (width, height), frame_data)
-    strip = _build_strip(image, mode)
+    strip = _build_strip(image, mode, use_cuda=use_cuda)
     return strip.size[0], strip.tobytes()
 
 
@@ -574,11 +688,13 @@ def _process_video_frames_streaming_in_memory(
     show_progress: bool,
     intermediate_dir: Path | None,
     output_format: str,
+    use_cuda_compute: bool = False,
+    use_cuda_decode: bool = False,
 ) -> tuple[list[tuple[int, bytes]], int]:
     frame_width, frame_height = _probe_video_dimensions(input_video)
     frame_byte_count = frame_width * frame_height * 3
-    extractor = _start_video_raw_extractor(input_video)
-    worker_count = _normalize_video_workers(workers, mode)
+    extractor = _start_video_raw_extractor(input_video, use_cuda=use_cuda_decode)
+    worker_count = _normalize_video_workers(workers, mode, use_cuda=use_cuda_compute)
     max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
     rows: list[tuple[int, bytes] | None] = []
     max_width = 0
@@ -590,30 +706,88 @@ def _process_video_frames_streaming_in_memory(
             raise RuntimeError("Failed to initialize ffmpeg frame stream.")
 
         if worker_count == 1:
-            frame_number = 1
+            frame_queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(maxsize=max_inflight)
+            producer_error: list[Exception] = []
+
+            def _producer() -> None:
+                frame_number = 1
+                try:
+                    while True:
+                        frame_data = _read_raw_video_frame(stdout_stream, frame_byte_count)
+                        if frame_data is None:
+                            break
+                        frame_queue.put((frame_number, frame_data))
+                        frame_number += 1
+                except Exception as error:  # pragma: no cover - protective path
+                    producer_error.append(error)
+                finally:
+                    frame_queue.put(None)
+
+            producer = threading.Thread(target=_producer, daemon=True)
+            producer.start()
+
+            stream_done = False
             while True:
-                frame_data = _read_raw_video_frame(stdout_stream, frame_byte_count)
-                if frame_data is None:
+                if stream_done:
                     break
-                row_index = frame_number - 1
-                width, data = _build_strip_from_frame_bytes(
-                    frame_data,
-                    frame_width,
-                    frame_height,
-                    mode,
+
+                item = frame_queue.get()
+                if item is None:
+                    break
+
+                frame_numbers: list[int] = [item[0]]
+                frame_batch: list[bytes] = [item[1]]
+                target_batch = (
+                    FLOW_CUDA_BATCH_SIZE if use_cuda_compute and mode == "flow" else 1
                 )
-                while len(rows) <= row_index:
-                    rows.append(None)
-                rows[row_index] = (width, data)
-                if width > max_width:
-                    max_width = width
-                if intermediate_dir is not None:
-                    strip = Image.frombytes("RGB", (width, 1), data)
-                    frame_name = Path(f"{frame_number:09d}.png")
-                    strip.save(_intermediate_path(intermediate_dir, frame_name, output_format))
-                if progress_bar is not None:
-                    progress_bar.update(1)
-                frame_number += 1
+
+                while len(frame_batch) < target_batch:
+                    try:
+                        queued_item = frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if queued_item is None:
+                        stream_done = True
+                        break
+                    frame_numbers.append(queued_item[0])
+                    frame_batch.append(queued_item[1])
+
+                if use_cuda_compute and mode == "flow":
+                    batch_rows = _build_flow_strips_from_frame_batch_bytes(
+                        frame_batch,
+                        frame_width,
+                        frame_height,
+                        use_cuda=use_cuda_compute,
+                    )
+                else:
+                    batch_rows = [
+                        _build_strip_from_frame_bytes(
+                            frame_data,
+                            frame_width,
+                            frame_height,
+                            mode,
+                            use_cuda=use_cuda_compute,
+                        )
+                        for frame_data in frame_batch
+                    ]
+
+                for frame_number, (width, data) in zip(frame_numbers, batch_rows, strict=True):
+                    row_index = frame_number - 1
+                    while len(rows) <= row_index:
+                        rows.append(None)
+                    rows[row_index] = (width, data)
+                    if width > max_width:
+                        max_width = width
+                    if intermediate_dir is not None:
+                        strip = Image.frombytes("RGB", (width, 1), data)
+                        frame_name = Path(f"{frame_number:09d}.png")
+                        strip.save(_intermediate_path(intermediate_dir, frame_name, output_format))
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+
+            producer.join(timeout=5)
+            if producer_error:
+                raise producer_error[0]
         else:
             with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
                 inflight: dict[concurrent.futures.Future[tuple[int, bytes]], tuple[int, int]] = {}
@@ -633,6 +807,7 @@ def _process_video_frames_streaming_in_memory(
                             frame_width,
                             frame_height,
                             mode,
+                            use_cuda_compute,
                         )
                         inflight[future] = (row_index, next_frame_number)
                         next_frame_number += 1
@@ -710,6 +885,7 @@ def _process_video_frames_streaming(
     show_progress: bool,
     intermediate_dir: Path | None,
     output_format: str,
+    use_cuda: bool = False,
 ) -> tuple[list[tuple[int, bytes]], int]:
     try:
         return _process_video_frames_streaming_in_memory(
@@ -719,8 +895,26 @@ def _process_video_frames_streaming(
             show_progress=show_progress,
             intermediate_dir=intermediate_dir,
             output_format=output_format,
+            use_cuda_compute=use_cuda,
+            use_cuda_decode=use_cuda,
         )
     except RuntimeError as error:
+        if use_cuda and (
+            "Failed to extract frames from video" in str(error)
+            or "ffmpeg is required to process video files." in str(error)
+        ):
+            # Retry with software decode if NVDEC path is unavailable, while keeping
+            # CUDA strip compute enabled when requested.
+            return _process_video_frames_streaming_in_memory(
+                input_video=input_video,
+                mode=mode,
+                workers=workers,
+                show_progress=show_progress,
+                intermediate_dir=intermediate_dir,
+                output_format=output_format,
+                use_cuda_compute=use_cuda,
+                use_cuda_decode=False,
+            )
         if "ffprobe is required for in-memory video processing." not in str(error):
             raise
         return _process_video_frames_streaming_disk(
@@ -731,12 +925,15 @@ def _process_video_frames_streaming(
             show_progress=show_progress,
             intermediate_dir=intermediate_dir,
             output_format=output_format,
+            use_cuda_compute=use_cuda,
+            use_cuda_decode=use_cuda,
         )
 
 
 def _collect_source_images(
     input_path: Path,
     temp_parent_dir: Path | None = None,
+    use_cuda: bool = False,
 ) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
     if input_path.is_dir():
         image_files = iter_image_files(input_path)
@@ -751,7 +948,7 @@ def _collect_source_images(
         else:
             temp_dir_obj = tempfile.TemporaryDirectory()
         temp_dir = Path(temp_dir_obj.name)
-        _extract_video_frames(input_path, temp_dir)
+        _extract_video_frames(input_path, temp_dir, use_cuda=use_cuda)
         image_files = iter_image_files(temp_dir)
         if not image_files:
             temp_dir_obj.cleanup()
@@ -774,7 +971,7 @@ def _average_strip(image: Image.Image) -> Image.Image:
     return Image.new("RGB", (image.width, 1), avg_color)
 
 
-def _flow_strip(image: Image.Image) -> Image.Image:
+def _flow_strip_cpu(image: Image.Image) -> Image.Image:
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
     height, width, _ = rgb.shape
     frame_max_channel = np.max(rgb.astype(np.float64), axis=2) / 255.0
@@ -863,15 +1060,217 @@ def _flow_strip(image: Image.Image) -> Image.Image:
     return Image.fromarray(row[np.newaxis, :, :], mode="RGB")
 
 
-def _build_strip(image: Image.Image, mode: str) -> Image.Image:
+def _flow_cuda_cache_for_frame(height: int, width: int):
+    cache_key = (height, width)
+    cached = _FLOW_CUDA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CUDA cache requested without CuPy installed.")
+
+    cached = {
+        "bin_indices": cp.arange(FLOW_BIN_COUNT, dtype=cp.int32)[cp.newaxis, :],
+        "row_indices": cp.arange(width, dtype=cp.int32),
+        "counts": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.int32),
+        "sum_r": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "sum_g": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "sum_b": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
+    }
+    _FLOW_CUDA_CACHE[cache_key] = cached
+    return cached
+
+
+def _flow_cuda_histogram_kernel():
+    global _FLOW_CUDA_HISTOGRAM_KERNEL
+    if _FLOW_CUDA_HISTOGRAM_KERNEL is not None:
+        return _FLOW_CUDA_HISTOGRAM_KERNEL
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CUDA histogram kernel requested without CuPy installed.")
+    _FLOW_CUDA_HISTOGRAM_KERNEL = cp.RawKernel(
+        _FLOW_CUDA_HISTOGRAM_KERNEL_SOURCE,
+        "flow_histogram_kernel",
+    )
+    return _FLOW_CUDA_HISTOGRAM_KERNEL
+
+
+def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
+    height, width, _ = rgb.shape
+    denominator = float(height)
+    cache = _flow_cuda_cache_for_frame(height, width)
+
+    frame_max_channel = cp.max(rgb.astype(cp.float32), axis=2) / 255.0
+    frame_luminance = (
+        0.2126 * rgb[:, :, 0].astype(cp.float32)
+        + 0.7152 * rgb[:, :, 1].astype(cp.float32)
+        + 0.0722 * rgb[:, :, 2].astype(cp.float32)
+    ) / 255.0
+    frame_near_black_ratio = float(
+        cp.mean(
+            (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
+            & (frame_max_channel <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD)
+        ).item()
+    )
+
+    quantized = rgb // FLOW_QUANTIZATION_SIZE
+    packed_bins = (
+        (quantized[:, :, 0].astype(cp.int32) << 8)
+        | (quantized[:, :, 1].astype(cp.int32) << 4)
+        | quantized[:, :, 2].astype(cp.int32)
+    )
+
+    bin_indices_flat = packed_bins.ravel()
+    counts = cache["counts"]
+    sum_r = cache["sum_r"]
+    sum_g = cache["sum_g"]
+    sum_b = cache["sum_b"]
+    counts.fill(0)
+    sum_r.fill(0)
+    sum_g.fill(0)
+    sum_b.fill(0)
+
+    kernel = _flow_cuda_histogram_kernel()
+    pixel_count = int(height * width)
+    threads_per_block = 256
+    blocks = (pixel_count + threads_per_block - 1) // threads_per_block
+    kernel(
+        (blocks,),
+        (threads_per_block,),
+        (
+            rgb.ravel(),
+            bin_indices_flat,
+            np.int32(width),
+            np.int32(pixel_count),
+            counts.ravel(),
+            sum_r.ravel(),
+            sum_g.ravel(),
+            sum_b.ravel(),
+        ),
+    )
+
+    used = counts > 0
+    counts_f = counts.astype(cp.float32)
+    safe_counts = cp.where(used, counts_f, 1.0)
+
+    centroid_r = cp.rint(sum_r / safe_counts).astype(cp.uint8)
+    centroid_g = cp.rint(sum_g / safe_counts).astype(cp.uint8)
+    centroid_b = cp.rint(sum_b / safe_counts).astype(cp.uint8)
+
+    r_norm = centroid_r.astype(cp.float32) / 255.0
+    g_norm = centroid_g.astype(cp.float32) / 255.0
+    b_norm = centroid_b.astype(cp.float32) / 255.0
+
+    maxc = cp.maximum(cp.maximum(r_norm, g_norm), b_norm)
+    minc = cp.minimum(cp.minimum(r_norm, g_norm), b_norm)
+    saturation = cp.zeros_like(maxc)
+    nonzero_mask = maxc != 0.0
+    saturation[nonzero_mask] = (maxc[nonzero_mask] - minc[nonzero_mask]) / maxc[nonzero_mask]
+    vibrance = saturation * maxc
+    luminance = 0.2126 * r_norm + 0.7152 * g_norm + 0.0722 * b_norm
+
+    freq = counts_f / denominator
+    score = freq * (
+        FLOW_BASE_COLOR_WEIGHT
+        + FLOW_VIBRANCE_WEIGHT * vibrance
+        + FLOW_LUMINANCE_WEIGHT * luminance
+    )
+    near_black_candidates = (luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD) & (
+        maxc <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD
+    )
+    score = cp.where(
+        near_black_candidates & (freq >= FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+        score + FLOW_NEAR_BLACK_DOMINANCE_BOOST * freq,
+        score,
+    )
+    if frame_near_black_ratio < FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD:
+        score = cp.where(
+            near_black_candidates & (freq < FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+            score * FLOW_NEAR_BLACK_PENALTY_MULTIPLIER,
+            score,
+        )
+
+    invalid_score = cp.asarray(-np.inf, dtype=cp.float32)
+    candidate_score = cp.where(used, score, invalid_score)
+    best_score = cp.max(candidate_score, axis=1, keepdims=True)
+    mask_score = used & (candidate_score == best_score)
+
+    candidate_count = cp.where(mask_score, counts_f, -1.0)
+    best_count = cp.max(candidate_count, axis=1, keepdims=True)
+    mask_count = mask_score & (counts_f == best_count)
+
+    candidate_vibrance = cp.where(mask_count, vibrance, -1.0)
+    best_vibrance = cp.max(candidate_vibrance, axis=1, keepdims=True)
+    mask_vibrance = mask_count & (vibrance == best_vibrance)
+
+    best_bins = cp.min(cp.where(mask_vibrance, cache["bin_indices"], FLOW_BIN_COUNT), axis=1)
+
+    row = cp.zeros((width, 3), dtype=cp.uint8)
+    row[:, 0] = centroid_r[cache["row_indices"], best_bins]
+    row[:, 1] = centroid_g[cache["row_indices"], best_bins]
+    row[:, 2] = centroid_b[cache["row_indices"], best_bins]
+
+    row_cpu = cp.asnumpy(row)
+    return Image.fromarray(row_cpu[np.newaxis, :, :], mode="RGB")
+
+
+def _flow_strip_cuda(image: Image.Image) -> Image.Image:
+    if cp is None:
+        raise RuntimeError(
+            "CUDA flow processing requested, but CuPy is not installed. "
+            "Install a CUDA build such as cupy-cuda12x and retry with --cuda."
+        )
+
+    try:
+        device_count = cp.cuda.runtime.getDeviceCount()
+    except cp.cuda.runtime.CUDARuntimeError as error:
+        raise RuntimeError(f"CUDA flow processing unavailable: {error}") from error
+    if device_count < 1:
+        raise RuntimeError("CUDA flow processing requested, but no CUDA devices were detected.")
+
+    rgb = cp.asarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+    return _flow_strip_cuda_from_rgb(rgb)
+
+
+def _build_flow_strips_from_frame_batch_bytes(
+    frame_batch: list[bytes],
+    width: int,
+    height: int,
+    use_cuda: bool,
+) -> list[tuple[int, bytes]]:
+    if not frame_batch:
+        return []
+    if not use_cuda or cp is None:
+        return [
+            _build_strip_from_frame_bytes(frame_data, width, height, "flow", use_cuda=False)
+            for frame_data in frame_batch
+        ]
+
+    frame_array = np.frombuffer(b"".join(frame_batch), dtype=np.uint8).reshape(
+        len(frame_batch), height, width, 3
+    )
+    rgb_batch = cp.asarray(frame_array)
+    results: list[tuple[int, bytes]] = []
+    for index in range(len(frame_batch)):
+        strip = _flow_strip_cuda_from_rgb(rgb_batch[index])
+        results.append((strip.size[0], strip.tobytes()))
+    return results
+
+
+def _build_strip(image: Image.Image, mode: str, use_cuda: bool = False) -> Image.Image:
     if mode == "average":
         return _average_strip(image)
-    return _flow_strip(image)
+    if _normalize_cuda(use_cuda, mode):
+        return _flow_strip_cuda(image)
+    return _flow_strip_cpu(image)
 
 
-def _build_strip_from_path(input_path: Path, mode: str) -> tuple[int, bytes]:
+def _build_strip_from_path(
+    input_path: Path,
+    mode: str,
+    use_cuda: bool = False,
+) -> tuple[int, bytes]:
     with Image.open(input_path) as image:
-        strip = _build_strip(image, mode)
+        strip = _build_strip(image, mode, use_cuda=use_cuda)
     return strip.size[0], strip.tobytes()
 
 
@@ -881,6 +1280,7 @@ def convert_to_strips(
     output_format: str = "tiff",
     mode: str = "average",
     workers: int | None = None,
+    use_cuda: bool = False,
 ) -> int:
     _validate_input_folder(input_folder)
     normalized_format = _normalize_output_format(output_format)
@@ -891,18 +1291,28 @@ def convert_to_strips(
     if not image_files:
         raise ValueError(f"No supported image files found in input folder: {input_folder}")
 
-    worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
+    worker_count = _normalize_flow_worker_count(
+        workers,
+        normalized_mode,
+        len(image_files),
+        use_cuda=use_cuda,
+    )
 
     if worker_count == 1:
         for input_path in image_files:
             with Image.open(input_path) as image:
-                strip = _build_strip(image, normalized_mode)
+                strip = _build_strip(image, normalized_mode, use_cuda=use_cuda)
                 strip.save(_intermediate_path(output_folder, input_path, normalized_format))
         return len(image_files)
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(_build_strip_from_path, input_path, normalized_mode): input_path
+            executor.submit(
+                _build_strip_from_path,
+                input_path,
+                normalized_mode,
+                use_cuda,
+            ): input_path
             for input_path in image_files
         }
         for future in concurrent.futures.as_completed(futures):
@@ -970,6 +1380,7 @@ def build_timeline_from_frames(
     output_format: str | None = None,
     mode: str = "average",
     workers: int | None = None,
+    use_cuda: bool = False,
     dither: str | None = None,
     palette_colors: list[str] | None = None,
 ) -> int:
@@ -988,14 +1399,21 @@ def build_timeline_from_frames(
             show_progress=show_progress,
             intermediate_dir=intermediate_dir,
             output_format=normalized_format,
+            use_cuda=use_cuda,
         )
     else:
         image_files, temp_dir_obj = _collect_source_images(
             input_folder,
             temp_parent_dir=output_file.parent,
+            use_cuda=use_cuda,
         )
         try:
-            worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
+            worker_count = _normalize_flow_worker_count(
+                workers,
+                normalized_mode,
+                len(image_files),
+                use_cuda=use_cuda,
+            )
             rows: list[tuple[int, bytes]] = [(0, b"")] * len(image_files)
             max_width = 0
 
@@ -1004,7 +1422,7 @@ def build_timeline_from_frames(
                     _progress(image_files, show_progress, desc="Processing frames")
                 ):
                     with Image.open(path) as image:
-                        strip = _build_strip(image, normalized_mode)
+                        strip = _build_strip(image, normalized_mode, use_cuda=use_cuda)
                     width = strip.size[0]
                     data = strip.tobytes()
                     rows[row_index] = (width, data)
@@ -1015,7 +1433,7 @@ def build_timeline_from_frames(
             else:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
                     futures = {
-                        executor.submit(_build_strip_from_path, path, normalized_mode): (
+                        executor.submit(_build_strip_from_path, path, normalized_mode, use_cuda): (
                             row_index,
                             path,
                         )

@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="Enable CUDA acceleration (NVDEC decode + CuPy flow strip compute when available).",
+    )
+    build_parser.add_argument(
         "--dither",
         choices=DITHER_CHOICES,
         default="none",
@@ -118,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Number of worker processes for strip generation "
             "(flow mode auto-parallelizes when omitted)."
         ),
+    )
+    convert_parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="Enable CUDA acceleration for flow strip computation when available.",
     )
 
     stack_parser = subparsers.add_parser(
@@ -191,6 +201,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             output_format=args.output_format,
             mode=args.mode,
             workers=args.workers,
+            use_cuda=args.cuda,
             dither=args.dither,
             palette_colors=args.palette_color,
         )
@@ -204,6 +215,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             output_format=args.output_format,
             mode=args.mode,
             workers=args.workers,
+            use_cuda=args.cuda,
         )
         print(f"Processed {count} image file(s) into {args.output_folder}")
         return 0

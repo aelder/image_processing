@@ -42,6 +42,10 @@ Issues = "https://github.com/aelder/image_processing/issues"
 
 [project.optional-dependencies]
 progress = ["tqdm>=4.66.0"]
+cuda = [
+  "cupy-cuda12x>=13.0.0",
+  "numba>=0.59.0",
+]
 dev = [
   "ruff>=0.6.0",
 ]

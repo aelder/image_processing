@@ -15,10 +15,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from img_timeline import core as core_module  # noqa: E402
 from img_timeline.core import (  # noqa: E402
     DEFAULT_FILMIC_16_PALETTE,
     PALETTE_COLOR_COUNT,
     _parse_video_dimensions,
+    _start_video_raw_extractor,
     build_timeline_from_frames,
     convert_to_strips,
     stack_tiff_images,
@@ -580,6 +582,79 @@ class TestImagePipeline(unittest.TestCase):
                 self.assertEqual(single_img.size, multi_img.size)
                 self.assertEqual(single_img.tobytes(), multi_img.tobytes())
 
+    def test_flow_cuda_strip_matches_cpu_strip(self):
+        if core_module.cp is None:
+            self.skipTest("CuPy not installed")
+
+        frame = Image.new("RGB", (4, 5))
+        px = frame.load()
+        for x in range(4):
+            for y in range(5):
+                if x == 0:
+                    px[x, y] = (220, 20, 20) if y < 4 else (40, 40, 40)
+                elif x == 1:
+                    px[x, y] = (20, 220, 20) if y != 2 else (10, 10, 10)
+                elif x == 2:
+                    px[x, y] = (20, 20, 220) if y < 3 else (15, 15, 15)
+                else:
+                    px[x, y] = (220, 180, 30) if y < 4 else (0, 0, 0)
+
+        try:
+            cpu_strip = core_module._flow_strip_cpu(frame)
+            cuda_strip = core_module._flow_strip_cuda(frame)
+        except RuntimeError as error:
+            self.skipTest(f"CUDA unavailable in environment: {error}")
+
+        self.assertEqual(cpu_strip.size, cuda_strip.size)
+        self.assertEqual(cpu_strip.tobytes(), cuda_strip.tobytes())
+
+    def test_build_timeline_flow_cuda_matches_cpu_output(self):
+        if core_module.cp is None:
+            self.skipTest("CuPy not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            cpu_out = root / "cpu.png"
+            cuda_out = root / "cuda.png"
+            source_dir.mkdir(parents=True)
+
+            for index in range(6):
+                frame = Image.new("RGB", (6, 5))
+                px = frame.load()
+                for x in range(6):
+                    for y in range(5):
+                        px[x, y] = (
+                            (index * 31 + x * 17 + y * 7) % 256,
+                            (index * 29 + y * 43 + x * 5) % 256,
+                            (index * 11 + x * y * 19) % 256,
+                        )
+                frame.save(source_dir / f"{index:03d}.png")
+
+            build_timeline_from_frames(
+                source_dir,
+                cpu_out,
+                output_format="png",
+                mode="flow",
+                workers=1,
+                use_cuda=False,
+            )
+            try:
+                build_timeline_from_frames(
+                    source_dir,
+                    cuda_out,
+                    output_format="png",
+                    mode="flow",
+                    workers=1,
+                    use_cuda=True,
+                )
+            except RuntimeError as error:
+                self.skipTest(f"CUDA unavailable in environment: {error}")
+
+            with Image.open(cpu_out) as cpu_img, Image.open(cuda_out) as cuda_img:
+                self.assertEqual(cpu_img.size, cuda_img.size)
+                self.assertEqual(cpu_img.tobytes(), cuda_img.tobytes())
+
     def test_parse_video_dimensions_from_default_ffprobe_output(self):
         width, height = _parse_video_dimensions("3840\n1600\n", Path("clip.mkv"))
         self.assertEqual((width, height), (3840, 1600))
@@ -768,6 +843,85 @@ class TestImagePipeline(unittest.TestCase):
                 for row_index, color in enumerate(expected):
                     self.assertEqual(pixels[0, row_index], color)
 
+    def test_video_flow_single_worker_preserves_frame_order(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+            expected = [(200, 10, 10), (10, 200, 10), (10, 10, 200), (120, 120, 30)]
+
+            raw_bytes = self._encode_solid_frames(expected, width=3, height=2)
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(3, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    count = build_timeline_from_frames(
+                        video_file,
+                        output_file,
+                        output_format="png",
+                        mode="flow",
+                        workers=1,
+                    )
+
+            self.assertEqual(count, len(expected))
+            with Image.open(output_file) as timeline:
+                pixels = timeline.load()
+                self.assertEqual(timeline.size, (3, len(expected)))
+                for row_index, color in enumerate(expected):
+                    self.assertEqual(pixels[0, row_index], color)
+
+    def test_video_flow_cuda_single_worker_uses_batch_helper(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            expected = [(200, 10, 10), (10, 200, 10), (10, 10, 200), (120, 120, 30), (80, 20, 220)]
+            raw_bytes = self._encode_solid_frames(expected, width=2, height=2)
+            batch_sizes: list[int] = []
+
+            def fake_batch_helper(
+                frame_batch: list[bytes],
+                width: int,
+                height: int,
+                use_cuda: bool,
+            ):
+                batch_sizes.append(len(frame_batch))
+                rows: list[tuple[int, bytes]] = []
+                for frame_data in frame_batch:
+                    red, green, blue = frame_data[0], frame_data[1], frame_data[2]
+                    rows.append((width, bytes([red, green, blue]) * width))
+                return rows
+
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    with patch(
+                        "img_timeline.core._build_flow_strips_from_frame_batch_bytes",
+                        side_effect=fake_batch_helper,
+                    ):
+                        count = build_timeline_from_frames(
+                            video_file,
+                            output_file,
+                            output_format="png",
+                            mode="flow",
+                            workers=1,
+                            use_cuda=True,
+                        )
+
+            self.assertEqual(count, len(expected))
+            self.assertTrue(any(size > 1 for size in batch_sizes))
+            with Image.open(output_file) as timeline:
+                pixels = timeline.load()
+                self.assertEqual(timeline.size, (2, len(expected)))
+                for row_index, color in enumerate(expected):
+                    self.assertEqual(pixels[0, row_index], color)
+
     def test_video_streaming_cleans_temp_on_processing_failure(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -777,7 +931,13 @@ class TestImagePipeline(unittest.TestCase):
 
             raw_bytes = self._encode_solid_frames([(255, 0, 0)], width=2, height=2)
 
-            def fake_build_strip(_frame_data: bytes, _width: int, _height: int, _mode: str):
+            def fake_build_strip(
+                _frame_data: bytes,
+                _width: int,
+                _height: int,
+                _mode: str,
+                use_cuda: bool = False,
+            ):
                 raise RuntimeError("Synthetic frame processing failure")
 
             with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
@@ -836,7 +996,7 @@ class TestImagePipeline(unittest.TestCase):
             video_file.write_bytes(b"dummy")
             captured_frame_dir: Path | None = None
 
-            def fake_start(_video_file: Path, frame_dir: Path):
+            def fake_start(_video_file: Path, frame_dir: Path, use_cuda: bool = False):
                 nonlocal captured_frame_dir
                 captured_frame_dir = frame_dir
                 Image.new("RGB", (2, 2), (10, 20, 30)).save(frame_dir / "000000001.png")
@@ -892,6 +1052,54 @@ class TestImagePipeline(unittest.TestCase):
                 self.assertEqual(timeline.mode, "P")
                 color_count = len(timeline.getcolors(maxcolors=300000) or [])
                 self.assertLessEqual(color_count, PALETTE_COLOR_COUNT)
+
+    def test_convert_flow_mode_uses_cuda_path_when_requested(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            output_dir = root / "out"
+            source_dir.mkdir(parents=True)
+            Image.new("RGB", (2, 2), (9, 8, 7)).save(source_dir / "001.png")
+
+            with patch("img_timeline.core._flow_strip_cpu", side_effect=AssertionError("cpu path")):
+                with patch(
+                    "img_timeline.core._flow_strip_cuda",
+                    return_value=Image.new("RGB", (2, 1), (1, 2, 3)),
+                ):
+                    count = convert_to_strips(
+                        source_dir,
+                        output_dir,
+                        output_format="png",
+                        mode="flow",
+                        use_cuda=True,
+                    )
+
+            self.assertEqual(count, 1)
+            with Image.open(output_dir / "001.png") as strip:
+                self.assertEqual(strip.size, (2, 1))
+                self.assertEqual(strip.load()[0, 0], (1, 2, 3))
+
+    def test_start_video_raw_extractor_adds_nvdec_flags_with_cuda(self):
+        commands: list[list[str]] = []
+
+        class _FakePopenProcess:
+            stdout = None
+            stderr = None
+
+        def fake_popen(command, **kwargs):
+            commands.append(command)
+            return _FakePopenProcess()
+
+        with patch("img_timeline.core.shutil.which", return_value="ffmpeg"):
+            with patch("img_timeline.core.subprocess.Popen", side_effect=fake_popen):
+                _start_video_raw_extractor(Path("clip.mp4"), use_cuda=True)
+
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertIn("-hwaccel", command)
+        self.assertIn("cuda", command)
+        self.assertIn("-vf", command)
+        self.assertIn("hwdownload,format=rgb24", command)
 
     def test_stack_dither_default_palette_png(self):
         with TemporaryDirectory() as temp_dir:
