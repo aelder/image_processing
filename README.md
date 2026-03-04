@@ -26,6 +26,7 @@ For `build` with video input:
 - Primary path: frames are decoded by `ffmpeg` as raw RGB to memory, then consumed by a bounded in-memory worker pipeline.
 - Backpressure: in-flight frame processing is capped and scales with worker count, so decode cannot run far ahead of strip generation.
 - Fallback path: if `ffprobe` is unavailable, the tool falls back to disk-backed temporary frame extraction.
+- Progress totals: with `--progress`, the pipeline performs a fast metadata probe for total frame count and shows determinate progress when available; if probing is unavailable/slow, it falls back to indeterminate progress updates.
 - With `--cuda` and `--mode flow`, decode and strip generation are pipelined in-memory for better overlap.
 - If NVDEC cannot decode the source stream/profile, decode automatically falls back to software while keeping CUDA strip compute enabled.
 
@@ -198,7 +199,7 @@ Use zero-padded names so lexical sort matches chronological order:
 - In single-worker video `flow` mode, CUDA processing uses bounded frame batching to reduce launch/transfer overhead while preserving row order.
 - For most videos this is significantly faster than CPU flow mode, especially at 4K widths.
 - Hardware decode acceleration depends on codec/profile support; unsupported streams transparently use software decode.
-- On this repository's current implementation, a 1000-frame 4K flow run completed in roughly 43 seconds on an RTX 4080 during local validation.
+- On this repository's current implementation, a 1000-frame 4K flow CUDA run completed in about 39 seconds on an RTX 4080 during local validation.
 
 ## Troubleshooting
 

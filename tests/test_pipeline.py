@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ from img_timeline.core import (  # noqa: E402
     DEFAULT_FILMIC_16_PALETTE,
     PALETTE_COLOR_COUNT,
     _parse_video_dimensions,
+    _probe_video_frame_count,
     _start_video_raw_extractor,
     build_timeline_from_frames,
     convert_to_strips,
@@ -667,6 +669,28 @@ class TestImagePipeline(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _parse_video_dimensions("not-dimensions", Path("clip.mkv"))
 
+    def test_probe_video_frame_count_parses_valid_integer(self):
+        with patch("img_timeline.core.shutil.which", return_value="ffprobe"):
+            completed = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout="120\n",
+                stderr="",
+            )
+            with patch("img_timeline.core.subprocess.run", return_value=completed):
+                self.assertEqual(_probe_video_frame_count(Path("clip.mkv")), 120)
+
+    def test_probe_video_frame_count_returns_none_when_unavailable(self):
+        with patch("img_timeline.core.shutil.which", return_value="ffprobe"):
+            completed = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout="N/A\n",
+                stderr="",
+            )
+            with patch("img_timeline.core.subprocess.run", return_value=completed):
+                self.assertIsNone(_probe_video_frame_count(Path("clip.mkv")))
+
     def test_build_flow_mode_with_video_input_smoke(self):
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path is None:
@@ -731,6 +755,98 @@ class TestImagePipeline(unittest.TestCase):
             self.assertEqual(count, 2)
             self.assertTrue(output_file.exists())
             self.assertEqual(list(output_file.parent.glob("tmp*")), [])
+
+    def test_video_in_memory_progress_uses_total_when_probe_available(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+            raw_bytes = self._encode_solid_frames([(10, 20, 30), (40, 50, 60)], width=2, height=2)
+
+            tqdm_calls: list[dict[str, object]] = []
+
+            class _FakeProgress:
+                def __init__(self, **kwargs):
+                    tqdm_calls.append(kwargs)
+                    self.updated = 0
+
+                def update(self, value):
+                    self.updated += value
+
+                def close(self):
+                    pass
+
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch("img_timeline.core._probe_video_frame_count", return_value=2):
+                    with patch(
+                        "img_timeline.core._start_video_raw_extractor",
+                        return_value=self._FakeRawExtractorProcess(raw_bytes),
+                    ):
+                        with patch(
+                            "img_timeline.core.tqdm",
+                            side_effect=lambda **kw: _FakeProgress(**kw),
+                        ):
+                            count = build_timeline_from_frames(
+                                video_file,
+                                output_file,
+                                output_format="png",
+                                mode="flow",
+                                show_progress=True,
+                            )
+
+            self.assertEqual(count, 2)
+            self.assertTrue(tqdm_calls)
+            self.assertEqual(tqdm_calls[0].get("total"), 2)
+
+    def test_video_disk_fallback_progress_uses_total_when_probe_available(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            tqdm_calls: list[dict[str, object]] = []
+
+            class _FakeProgress:
+                def __init__(self, **kwargs):
+                    tqdm_calls.append(kwargs)
+
+                def update(self, _value):
+                    pass
+
+                def close(self):
+                    pass
+
+            def fake_start(_video_file: Path, frame_dir: Path, use_cuda: bool = False):
+                Image.new("RGB", (2, 2), (10, 20, 30)).save(frame_dir / "000000001.png")
+                Image.new("RGB", (2, 2), (40, 50, 60)).save(frame_dir / "000000002.png")
+                return self._FakeExtractorProcess()
+
+            with patch(
+                "img_timeline.core._probe_video_dimensions",
+                side_effect=RuntimeError("ffprobe is required for in-memory video processing."),
+            ):
+                with patch("img_timeline.core._probe_video_frame_count", return_value=2):
+                    with patch(
+                        "img_timeline.core._start_video_frame_extractor",
+                        side_effect=fake_start,
+                    ):
+                        with patch(
+                            "img_timeline.core.tqdm",
+                            side_effect=lambda **kw: _FakeProgress(**kw),
+                        ):
+                            count = build_timeline_from_frames(
+                                video_file,
+                                output_file,
+                                output_format="png",
+                                mode="flow",
+                                show_progress=True,
+                            )
+
+            self.assertEqual(count, 2)
+            self.assertTrue(tqdm_calls)
+            self.assertEqual(tqdm_calls[0].get("total"), 2)
 
     def test_video_in_memory_backpressure_limits_inflight_work(self):
         with TemporaryDirectory() as temp_dir:
@@ -915,12 +1031,47 @@ class TestImagePipeline(unittest.TestCase):
                         )
 
             self.assertEqual(count, len(expected))
+            self.assertEqual(sum(batch_sizes), len(expected))
             self.assertTrue(any(size > 1 for size in batch_sizes))
+            self.assertTrue(all(size <= core_module.FLOW_CUDA_BATCH_SIZE for size in batch_sizes))
             with Image.open(output_file) as timeline:
                 pixels = timeline.load()
                 self.assertEqual(timeline.size, (2, len(expected)))
                 for row_index, color in enumerate(expected):
                     self.assertEqual(pixels[0, row_index], color)
+
+    def test_flow_cpu_cache_reuses_same_shape_buffers(self):
+        core_module._FLOW_CPU_CACHE.clear()
+
+        first = Image.new("RGB", (4, 3), (10, 20, 30))
+        second = Image.new("RGB", (4, 3), (40, 50, 60))
+        core_module._flow_strip_cpu(first)
+        cache_a = core_module._flow_cpu_cache_for_frame(height=3, width=4)
+
+        core_module._flow_strip_cpu(second)
+        cache_b = core_module._flow_cpu_cache_for_frame(height=3, width=4)
+        self.assertIs(cache_a, cache_b)
+
+        cache_c = core_module._flow_cpu_cache_for_frame(height=2, width=4)
+        self.assertIsNot(cache_a, cache_c)
+
+    def test_flow_cuda_batch_rows_match_single_frame_rows(self):
+        if core_module.cp is None:
+            self.skipTest("CuPy not installed")
+
+        rng = np.random.default_rng(77)
+        frame_array = rng.integers(0, 256, size=(3, 4, 5, 3), dtype=np.uint8)
+        try:
+            rows = core_module._flow_rows_cuda_from_rgb_batch(core_module.cp.asarray(frame_array))
+            rows_cpu = core_module.cp.asnumpy(rows)
+        except Exception as error:
+            self.skipTest(f"CUDA unavailable in environment: {error}")
+
+        for index in range(frame_array.shape[0]):
+            strip = core_module._flow_strip_cuda_from_rgb(
+                core_module.cp.asarray(frame_array[index])
+            )
+            self.assertEqual(rows_cpu[index].tobytes(), strip.tobytes())
 
     def test_video_streaming_cleans_temp_on_processing_failure(self):
         with TemporaryDirectory() as temp_dir:

@@ -81,7 +81,9 @@ VIDEO_POLL_INTERVAL_SECONDS = 0.05
 VIDEO_INFLIGHT_MULTIPLIER = 2
 FLOW_BIN_COUNT = 4096
 FLOW_CUDA_BATCH_SIZE = 4
+VIDEO_FRAME_COUNT_PROBE_TIMEOUT_SECONDS = 1.5
 
+_FLOW_CPU_CACHE: dict[tuple[int, int], dict[str, np.ndarray]] = {}
 _FLOW_CUDA_CACHE: dict[tuple[int, int], dict[str, cp.ndarray]] = {}
 _FLOW_CUDA_HISTOGRAM_KERNEL = None
 _FLOW_CUDA_HISTOGRAM_KERNEL_SOURCE = r"""
@@ -90,6 +92,7 @@ void flow_histogram_kernel(
     const unsigned char* rgb,
     const int* packed_bins,
     const int width,
+    const int frame_pixel_count,
     const int pixel_count,
     int* counts,
     float* sum_r,
@@ -101,9 +104,11 @@ void flow_histogram_kernel(
         return;
     }
 
-    int col = idx % width;
+    int pixel_in_frame = idx % frame_pixel_count;
+    int frame = idx / frame_pixel_count;
+    int col = pixel_in_frame % width;
     int bin = packed_bins[idx];
-    int offset = (col * 4096) + bin;
+    int offset = ((frame * width + col) * 4096) + bin;
     int rgb_offset = idx * 3;
 
     atomicAdd(&counts[offset], 1);
@@ -453,6 +458,50 @@ def _probe_video_dimensions(video_file: Path) -> tuple[int, int]:
     return _parse_video_dimensions(result.stdout, video_file)
 
 
+def _probe_video_frame_count(video_file: Path) -> int | None:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_file),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=VIDEO_FRAME_COUNT_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    value = lines[0]
+    if not value.isdigit():
+        return None
+
+    frame_count = int(value)
+    if frame_count <= 0:
+        return None
+    return frame_count
+
+
 def _start_video_raw_extractor(video_file: Path, use_cuda: bool = False) -> subprocess.Popen[bytes]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
@@ -562,7 +611,12 @@ def _process_video_frames_streaming_disk(
     max_width = 0
     next_frame_number = 1
     inflight: dict[concurrent.futures.Future[tuple[int, bytes]], tuple[int, Path]] = {}
-    progress_bar = tqdm(desc="Processing frames", unit="frame") if show_progress and tqdm else None
+    total_frames = _probe_video_frame_count(input_video) if show_progress and tqdm else None
+    progress_bar = (
+        tqdm(desc="Processing frames", unit="frame", total=total_frames)
+        if show_progress and tqdm
+        else None
+    )
 
     try:
         if worker_count == 1:
@@ -698,7 +752,12 @@ def _process_video_frames_streaming_in_memory(
     max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
     rows: list[tuple[int, bytes] | None] = []
     max_width = 0
-    progress_bar = tqdm(desc="Processing frames", unit="frame") if show_progress and tqdm else None
+    total_frames = _probe_video_frame_count(input_video) if show_progress and tqdm else None
+    progress_bar = (
+        tqdm(desc="Processing frames", unit="frame", total=total_frames)
+        if show_progress and tqdm
+        else None
+    )
 
     try:
         stdout_stream = extractor.stdout
@@ -971,15 +1030,41 @@ def _average_strip(image: Image.Image) -> Image.Image:
     return Image.new("RGB", (image.width, 1), avg_color)
 
 
+def _image_to_rgb_uint8_array(image: Image.Image) -> np.ndarray:
+    if image.mode == "RGB":
+        return np.asarray(image, dtype=np.uint8)
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def _flow_cpu_cache_for_frame(height: int, width: int) -> dict[str, np.ndarray]:
+    cache_key = (height, width)
+    cached = _FLOW_CPU_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    cached = {
+        "counts": np.zeros(FLOW_BIN_COUNT, dtype=np.int32),
+        "sum_r": np.zeros(FLOW_BIN_COUNT, dtype=np.float64),
+        "sum_g": np.zeros(FLOW_BIN_COUNT, dtype=np.float64),
+        "sum_b": np.zeros(FLOW_BIN_COUNT, dtype=np.float64),
+    }
+    _FLOW_CPU_CACHE[cache_key] = cached
+    return cached
+
+
 def _flow_strip_cpu(image: Image.Image) -> Image.Image:
-    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    rgb = _image_to_rgb_uint8_array(image)
     height, width, _ = rgb.shape
-    frame_max_channel = np.max(rgb.astype(np.float64), axis=2) / 255.0
-    frame_luminance = (
-        0.2126 * rgb[:, :, 0].astype(np.float64)
-        + 0.7152 * rgb[:, :, 1].astype(np.float64)
-        + 0.0722 * rgb[:, :, 2].astype(np.float64)
-    ) / 255.0
+    cache = _flow_cpu_cache_for_frame(height, width)
+    counts_cache = cache["counts"]
+    sum_r_cache = cache["sum_r"]
+    sum_g_cache = cache["sum_g"]
+    sum_b_cache = cache["sum_b"]
+
+    red = rgb[:, :, 0].astype(np.float64)
+    green = rgb[:, :, 1].astype(np.float64)
+    blue = rgb[:, :, 2].astype(np.float64)
+    frame_max_channel = np.maximum(np.maximum(red, green), blue) / 255.0
+    frame_luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255.0
     frame_near_black_ratio = float(
         np.mean(
             (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
@@ -999,17 +1084,28 @@ def _flow_strip_cpu(image: Image.Image) -> Image.Image:
 
     for x in range(width):
         col_bins = packed_bins[:, x]
-        counts = np.bincount(col_bins, minlength=4096)
-        used = np.nonzero(counts)[0]
-        used_counts = counts[used].astype(np.float64)
+        counts_cache.fill(0)
+        counts_raw = np.bincount(col_bins)
+        counts_cache[: counts_raw.size] = counts_raw.astype(np.int32, copy=False)
+        used = np.nonzero(counts_cache)[0]
+        used_counts = counts_cache[used].astype(np.float64, copy=False)
 
-        col_r = rgb[:, x, 0].astype(np.float64)
-        col_g = rgb[:, x, 1].astype(np.float64)
-        col_b = rgb[:, x, 2].astype(np.float64)
+        col_r = red[:, x]
+        col_g = green[:, x]
+        col_b = blue[:, x]
 
-        sum_r = np.bincount(col_bins, weights=col_r, minlength=4096)[used]
-        sum_g = np.bincount(col_bins, weights=col_g, minlength=4096)[used]
-        sum_b = np.bincount(col_bins, weights=col_b, minlength=4096)[used]
+        sum_r_cache.fill(0.0)
+        sum_g_cache.fill(0.0)
+        sum_b_cache.fill(0.0)
+        sum_r_raw = np.bincount(col_bins, weights=col_r)
+        sum_g_raw = np.bincount(col_bins, weights=col_g)
+        sum_b_raw = np.bincount(col_bins, weights=col_b)
+        sum_r_cache[: sum_r_raw.size] = sum_r_raw
+        sum_g_cache[: sum_g_raw.size] = sum_g_raw
+        sum_b_cache[: sum_b_raw.size] = sum_b_raw
+        sum_r = sum_r_cache[used]
+        sum_g = sum_g_cache[used]
+        sum_b = sum_b_cache[used]
 
         centroid_r = np.rint(sum_r / used_counts).astype(np.uint8)
         centroid_g = np.rint(sum_g / used_counts).astype(np.uint8)
@@ -1051,8 +1147,14 @@ def _flow_strip_cpu(image: Image.Image) -> Image.Image:
                 score,
             )
 
-        order = np.lexsort((used, -vibrance, -used_counts, -score))
-        best = order[0]
+        best_score = np.max(score)
+        mask_score = score == best_score
+        best_count = np.max(used_counts[mask_score])
+        mask_count = mask_score & (used_counts == best_count)
+        best_vibrance = np.max(vibrance[mask_count])
+        mask_vibrance = mask_count & (vibrance == best_vibrance)
+        candidate_idx = np.nonzero(mask_vibrance)[0]
+        best = candidate_idx[np.argmin(used[candidate_idx])]
         row[x, 0] = centroid_r[best]
         row[x, 1] = centroid_g[best]
         row[x, 2] = centroid_b[best]
@@ -1060,8 +1162,8 @@ def _flow_strip_cpu(image: Image.Image) -> Image.Image:
     return Image.fromarray(row[np.newaxis, :, :], mode="RGB")
 
 
-def _flow_cuda_cache_for_frame(height: int, width: int):
-    cache_key = (height, width)
+def _flow_cuda_cache_for_shape(batch_size: int, width: int):
+    cache_key = (batch_size, width)
     cached = _FLOW_CUDA_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -1070,12 +1172,13 @@ def _flow_cuda_cache_for_frame(height: int, width: int):
         raise RuntimeError("CUDA cache requested without CuPy installed.")
 
     cached = {
-        "bin_indices": cp.arange(FLOW_BIN_COUNT, dtype=cp.int32)[cp.newaxis, :],
-        "row_indices": cp.arange(width, dtype=cp.int32),
-        "counts": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.int32),
-        "sum_r": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
-        "sum_g": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
-        "sum_b": cp.zeros((width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "bin_indices": cp.arange(FLOW_BIN_COUNT, dtype=cp.int32)[cp.newaxis, cp.newaxis, :],
+        "frame_indices": cp.arange(batch_size, dtype=cp.int32)[:, cp.newaxis],
+        "row_indices": cp.arange(width, dtype=cp.int32)[cp.newaxis, :],
+        "counts": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.int32),
+        "sum_r": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "sum_g": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "sum_b": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
     }
     _FLOW_CUDA_CACHE[cache_key] = cached
     return cached
@@ -1094,29 +1197,28 @@ def _flow_cuda_histogram_kernel():
     return _FLOW_CUDA_HISTOGRAM_KERNEL
 
 
-def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
-    height, width, _ = rgb.shape
+def _flow_rows_cuda_from_rgb_batch(rgb_batch: cp.ndarray) -> cp.ndarray:
+    batch_size, height, width, _ = rgb_batch.shape
     denominator = float(height)
-    cache = _flow_cuda_cache_for_frame(height, width)
+    cache = _flow_cuda_cache_for_shape(batch_size, width)
 
-    frame_max_channel = cp.max(rgb.astype(cp.float32), axis=2) / 255.0
+    frame_max_channel = cp.max(rgb_batch.astype(cp.float32), axis=3) / 255.0
     frame_luminance = (
-        0.2126 * rgb[:, :, 0].astype(cp.float32)
-        + 0.7152 * rgb[:, :, 1].astype(cp.float32)
-        + 0.0722 * rgb[:, :, 2].astype(cp.float32)
+        0.2126 * rgb_batch[:, :, :, 0].astype(cp.float32)
+        + 0.7152 * rgb_batch[:, :, :, 1].astype(cp.float32)
+        + 0.0722 * rgb_batch[:, :, :, 2].astype(cp.float32)
     ) / 255.0
-    frame_near_black_ratio = float(
-        cp.mean(
-            (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
-            & (frame_max_channel <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD)
-        ).item()
+    frame_near_black_ratio = cp.mean(
+        (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
+        & (frame_max_channel <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD),
+        axis=(1, 2),
     )
 
-    quantized = rgb // FLOW_QUANTIZATION_SIZE
+    quantized = rgb_batch // FLOW_QUANTIZATION_SIZE
     packed_bins = (
-        (quantized[:, :, 0].astype(cp.int32) << 8)
-        | (quantized[:, :, 1].astype(cp.int32) << 4)
-        | quantized[:, :, 2].astype(cp.int32)
+        (quantized[:, :, :, 0].astype(cp.int32) << 8)
+        | (quantized[:, :, :, 1].astype(cp.int32) << 4)
+        | quantized[:, :, :, 2].astype(cp.int32)
     )
 
     bin_indices_flat = packed_bins.ravel()
@@ -1130,16 +1232,18 @@ def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
     sum_b.fill(0)
 
     kernel = _flow_cuda_histogram_kernel()
-    pixel_count = int(height * width)
+    frame_pixel_count = int(height * width)
+    pixel_count = int(batch_size * frame_pixel_count)
     threads_per_block = 256
     blocks = (pixel_count + threads_per_block - 1) // threads_per_block
     kernel(
         (blocks,),
         (threads_per_block,),
         (
-            rgb.ravel(),
+            rgb_batch.ravel(),
             bin_indices_flat,
             np.int32(width),
+            np.int32(frame_pixel_count),
             np.int32(pixel_count),
             counts.ravel(),
             sum_r.ravel(),
@@ -1182,34 +1286,40 @@ def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
         score + FLOW_NEAR_BLACK_DOMINANCE_BOOST * freq,
         score,
     )
-    if frame_near_black_ratio < FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD:
-        score = cp.where(
-            near_black_candidates & (freq < FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
-            score * FLOW_NEAR_BLACK_PENALTY_MULTIPLIER,
-            score,
-        )
+    frame_is_dark = (
+        frame_near_black_ratio[:, cp.newaxis, cp.newaxis]
+        < FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD
+    )
+    score = cp.where(
+        frame_is_dark & near_black_candidates & (freq < FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+        score * FLOW_NEAR_BLACK_PENALTY_MULTIPLIER,
+        score,
+    )
 
     invalid_score = cp.asarray(-np.inf, dtype=cp.float32)
     candidate_score = cp.where(used, score, invalid_score)
-    best_score = cp.max(candidate_score, axis=1, keepdims=True)
+    best_score = cp.max(candidate_score, axis=2, keepdims=True)
     mask_score = used & (candidate_score == best_score)
 
     candidate_count = cp.where(mask_score, counts_f, -1.0)
-    best_count = cp.max(candidate_count, axis=1, keepdims=True)
+    best_count = cp.max(candidate_count, axis=2, keepdims=True)
     mask_count = mask_score & (counts_f == best_count)
 
     candidate_vibrance = cp.where(mask_count, vibrance, -1.0)
-    best_vibrance = cp.max(candidate_vibrance, axis=1, keepdims=True)
+    best_vibrance = cp.max(candidate_vibrance, axis=2, keepdims=True)
     mask_vibrance = mask_count & (vibrance == best_vibrance)
 
-    best_bins = cp.min(cp.where(mask_vibrance, cache["bin_indices"], FLOW_BIN_COUNT), axis=1)
+    best_bins = cp.min(cp.where(mask_vibrance, cache["bin_indices"], FLOW_BIN_COUNT), axis=2)
 
-    row = cp.zeros((width, 3), dtype=cp.uint8)
-    row[:, 0] = centroid_r[cache["row_indices"], best_bins]
-    row[:, 1] = centroid_g[cache["row_indices"], best_bins]
-    row[:, 2] = centroid_b[cache["row_indices"], best_bins]
+    rows = cp.empty((batch_size, width, 3), dtype=cp.uint8)
+    rows[:, :, 0] = centroid_r[cache["frame_indices"], cache["row_indices"], best_bins]
+    rows[:, :, 1] = centroid_g[cache["frame_indices"], cache["row_indices"], best_bins]
+    rows[:, :, 2] = centroid_b[cache["frame_indices"], cache["row_indices"], best_bins]
+    return rows
 
-    row_cpu = cp.asnumpy(row)
+def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
+    rows = _flow_rows_cuda_from_rgb_batch(rgb[cp.newaxis, :, :, :])
+    row_cpu = cp.asnumpy(rows[0])
     return Image.fromarray(row_cpu[np.newaxis, :, :], mode="RGB")
 
 
@@ -1227,7 +1337,7 @@ def _flow_strip_cuda(image: Image.Image) -> Image.Image:
     if device_count < 1:
         raise RuntimeError("CUDA flow processing requested, but no CUDA devices were detected.")
 
-    rgb = cp.asarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+    rgb = cp.asarray(_image_to_rgb_uint8_array(image))
     return _flow_strip_cuda_from_rgb(rgb)
 
 
@@ -1249,11 +1359,9 @@ def _build_flow_strips_from_frame_batch_bytes(
         len(frame_batch), height, width, 3
     )
     rgb_batch = cp.asarray(frame_array)
-    results: list[tuple[int, bytes]] = []
-    for index in range(len(frame_batch)):
-        strip = _flow_strip_cuda_from_rgb(rgb_batch[index])
-        results.append((strip.size[0], strip.tobytes()))
-    return results
+    rows = _flow_rows_cuda_from_rgb_batch(rgb_batch)
+    rows_cpu = cp.asnumpy(rows)
+    return [(width, rows_cpu[index].tobytes()) for index in range(len(frame_batch))]
 
 
 def _build_strip(image: Image.Image, mode: str, use_cuda: bool = False) -> Image.Image:
