@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import subprocess
@@ -5,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -16,6 +18,7 @@ if str(SRC) not in sys.path:
 from img_timeline.core import (  # noqa: E402
     DEFAULT_FILMIC_16_PALETTE,
     PALETTE_COLOR_COUNT,
+    _parse_video_dimensions,
     build_timeline_from_frames,
     convert_to_strips,
     stack_tiff_images,
@@ -23,9 +26,52 @@ from img_timeline.core import (  # noqa: E402
 
 
 class TestImagePipeline(unittest.TestCase):
+    class _FakeExtractorProcess:
+        def __init__(self, returncode: int = 0, stderr_text: str = "") -> None:
+            self.returncode = returncode
+            self.stderr = io.StringIO(stderr_text)
+
+        def poll(self) -> int:
+            return self.returncode
+
+    class _FakeRawExtractorProcess:
+        def __init__(
+            self,
+            frame_bytes: bytes,
+            returncode: int = 0,
+            stderr_bytes: bytes = b"",
+        ) -> None:
+            self.returncode = returncode
+            self.stdout = io.BytesIO(frame_bytes)
+            self.stderr = io.BytesIO(stderr_bytes)
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
     @staticmethod
     def _default_palette_hex() -> list[str]:
         return [f"#{r:02X}{g:02X}{b:02X}" for r, g, b in DEFAULT_FILMIC_16_PALETTE]
+
+    @staticmethod
+    def _encode_solid_frames(
+        colors: list[tuple[int, int, int]],
+        width: int,
+        height: int,
+    ) -> bytes:
+        frame_size = width * height
+        payload = bytearray()
+        for red, green, blue in colors:
+            payload.extend(bytes([red, green, blue]) * frame_size)
+        return bytes(payload)
 
     def test_pipeline_direct_output_sorted_order(self):
         with TemporaryDirectory() as temp_dir:
@@ -534,6 +580,18 @@ class TestImagePipeline(unittest.TestCase):
                 self.assertEqual(single_img.size, multi_img.size)
                 self.assertEqual(single_img.tobytes(), multi_img.tobytes())
 
+    def test_parse_video_dimensions_from_default_ffprobe_output(self):
+        width, height = _parse_video_dimensions("3840\n1600\n", Path("clip.mkv"))
+        self.assertEqual((width, height), (3840, 1600))
+
+    def test_parse_video_dimensions_from_csv_with_trailing_separator(self):
+        width, height = _parse_video_dimensions("3840x1600x", Path("clip.mkv"))
+        self.assertEqual((width, height), (3840, 1600))
+
+    def test_parse_video_dimensions_rejects_invalid_output(self):
+        with self.assertRaises(RuntimeError):
+            _parse_video_dimensions("not-dimensions", Path("clip.mkv"))
+
     def test_build_flow_mode_with_video_input_smoke(self):
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path is None:
@@ -574,6 +632,237 @@ class TestImagePipeline(unittest.TestCase):
 
             with Image.open(output_file) as timeline:
                 self.assertEqual(timeline.size, (4, 3))
+
+    def test_video_in_memory_path_avoids_temp_frame_files(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "nested" / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            raw_bytes = self._encode_solid_frames([(10, 20, 30), (40, 50, 60)], width=2, height=2)
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    count = build_timeline_from_frames(
+                        video_file,
+                        output_file,
+                        output_format="png",
+                        mode="flow",
+                    )
+
+            self.assertEqual(count, 2)
+            self.assertTrue(output_file.exists())
+            self.assertEqual(list(output_file.parent.glob("tmp*")), [])
+
+    def test_video_in_memory_backpressure_limits_inflight_work(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            frame_count = 12
+            colors = [
+                (idx * 10 % 255, idx * 20 % 255, idx * 30 % 255)
+                for idx in range(frame_count)
+            ]
+            raw_bytes = self._encode_solid_frames(colors, width=2, height=2)
+            max_outstanding = 0
+            all_futures = []
+            worker_count = 4
+            expected_cap = worker_count * 2
+
+            class _FakeFuture:
+                def __init__(self, value):
+                    self._value = value
+                    self._done = False
+
+                def result(self):
+                    return self._value
+
+                def done(self):
+                    return self._done
+
+            class _FakeExecutor:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def submit(self, fn, *args, **kwargs):
+                    nonlocal max_outstanding
+                    value = fn(*args, **kwargs)
+                    future = _FakeFuture(value)
+                    all_futures.append(future)
+                    outstanding = sum(1 for item in all_futures if not item.done())
+                    max_outstanding = max(max_outstanding, outstanding)
+                    return future
+
+            def fake_wait(futures, timeout=None, return_when=None):
+                pending = [future for future in futures if not future.done()]
+                if not pending:
+                    return set(), set()
+                pending[0]._done = True
+                done = {pending[0]}
+                remaining = set(future for future in futures if not future.done())
+                return done, remaining
+
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    with patch(
+                        "img_timeline.core.concurrent.futures.ProcessPoolExecutor",
+                        _FakeExecutor,
+                    ):
+                        with patch(
+                            "img_timeline.core.concurrent.futures.wait",
+                            side_effect=fake_wait,
+                        ):
+                            count = build_timeline_from_frames(
+                                video_file,
+                                output_file,
+                                output_format="png",
+                                mode="flow",
+                                workers=worker_count,
+                            )
+
+            self.assertEqual(count, frame_count)
+            self.assertLessEqual(max_outstanding, expected_cap)
+            self.assertEqual(max_outstanding, expected_cap)
+
+    def test_video_flow_multi_worker_preserves_frame_order(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+            expected = [(200, 10, 10), (10, 200, 10), (10, 10, 200), (120, 120, 30)]
+
+            raw_bytes = self._encode_solid_frames(expected, width=3, height=2)
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(3, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    count = build_timeline_from_frames(
+                        video_file,
+                        output_file,
+                        output_format="png",
+                        mode="flow",
+                        workers=3,
+                    )
+
+            self.assertEqual(count, len(expected))
+            with Image.open(output_file) as timeline:
+                pixels = timeline.load()
+                self.assertEqual(timeline.size, (3, len(expected)))
+                for row_index, color in enumerate(expected):
+                    self.assertEqual(pixels[0, row_index], color)
+
+    def test_video_streaming_cleans_temp_on_processing_failure(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            raw_bytes = self._encode_solid_frames([(255, 0, 0)], width=2, height=2)
+
+            def fake_build_strip(_frame_data: bytes, _width: int, _height: int, _mode: str):
+                raise RuntimeError("Synthetic frame processing failure")
+
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=self._FakeRawExtractorProcess(raw_bytes),
+                ):
+                    with patch(
+                        "img_timeline.core._build_strip_from_frame_bytes",
+                        side_effect=fake_build_strip,
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            build_timeline_from_frames(
+                                video_file,
+                                output_file,
+                                output_format="png",
+                                mode="flow",
+                                workers=1,
+                            )
+
+            self.assertEqual(list(output_file.parent.glob("tmp*")), [])
+
+    def test_video_streaming_cleans_temp_on_ffmpeg_failure(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+
+            failing_extractor = self._FakeRawExtractorProcess(
+                frame_bytes=b"",
+                returncode=1,
+                stderr_bytes=b"ffmpeg failed",
+            )
+
+            with patch("img_timeline.core._probe_video_dimensions", return_value=(2, 2)):
+                with patch(
+                    "img_timeline.core._start_video_raw_extractor",
+                    return_value=failing_extractor,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        build_timeline_from_frames(
+                            video_file,
+                            output_file,
+                            output_format="png",
+                            mode="flow",
+                        )
+
+            self.assertEqual(list(output_file.parent.glob("tmp*")), [])
+
+    def test_video_disk_streaming_fallback_when_ffprobe_missing(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_file = root / "clip.mkv"
+            output_file = root / "out" / "timeline.png"
+            video_file.write_bytes(b"dummy")
+            captured_frame_dir: Path | None = None
+
+            def fake_start(_video_file: Path, frame_dir: Path):
+                nonlocal captured_frame_dir
+                captured_frame_dir = frame_dir
+                Image.new("RGB", (2, 2), (10, 20, 30)).save(frame_dir / "000000001.png")
+                Image.new("RGB", (2, 2), (40, 50, 60)).save(frame_dir / "000000002.png")
+                return self._FakeExtractorProcess()
+
+            with patch(
+                "img_timeline.core._probe_video_dimensions",
+                side_effect=RuntimeError("ffprobe is required for in-memory video processing."),
+            ):
+                with patch(
+                    "img_timeline.core._start_video_frame_extractor",
+                    side_effect=fake_start,
+                ):
+                    count = build_timeline_from_frames(
+                        video_file,
+                        output_file,
+                        output_format="png",
+                        mode="flow",
+                    )
+
+            self.assertEqual(count, 2)
+            self.assertIsNotNone(captured_frame_dir)
+            assert captured_frame_dir is not None
+            self.assertEqual(captured_frame_dir.parent, output_file.parent)
+            self.assertFalse(captured_frame_dir.exists())
 
     def test_build_dither_default_palette_png(self):
         with TemporaryDirectory() as temp_dir:

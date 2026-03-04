@@ -25,6 +25,10 @@ Options:
 - `--palette-color <#RRGGBB>` (repeat 16 times): custom palette for dithering.
 - `--progress`: show progress bars (requires `tqdm`).
 
+For video inputs, frames are decoded and consumed in memory through a bounded frame buffer before
+timeline row generation. This introduces backpressure so extraction/decode cannot run far ahead of
+processing. If `ffprobe` is unavailable, processing falls back to temporary on-disk frame extraction.
+
 ### 2) Convert to strips (legacy step)
 
 ```bash
@@ -66,6 +70,7 @@ These still work for compatibility:
 - Raises `FileNotFoundError` if the input path does not exist.
 - Raises `ValueError` if no supported image files are found in an input folder.
 - Raises `RuntimeError` for video input if `ffmpeg` is not installed.
+- Raises `RuntimeError` if ffmpeg extraction fails.
 
 ## Output semantics
 

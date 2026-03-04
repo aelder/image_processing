@@ -1,173 +1,145 @@
 # img-timeline
 
-Create a color timeline from every frame of an exported movie.
+Create a color timeline from image frame sequences or directly from video files.
 
 ![CI](https://github.com/aelder/image_processing/actions/workflows/ci.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 
-`img-timeline` is a movie color analysis tool that reads image frame sequences (TIFF, PNG, JPEG, WebP, BMP, GIF) or supported video files (MP4/MOV/MKV/AVI/WebM and more), and writes a timeline image with one row per frame.  
-Stretch that timeline vertically in an editor and you get a compact infographic of the movie's color progression over time.
+`img-timeline` reads source frames (`.tif/.tiff`, `.png`, `.jpg/.jpeg`, `.webp`, `.bmp`, `.gif`) or supported video files (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, and more), then writes one timeline row per frame.
 
-## Sample Output
+The resulting image is usually narrow and very tall. Scale it vertically to produce poster-style color progression visuals.
 
-These examples are generated from the trailer for *The Red Balloon* (1956):
+## What It Does
 
-```bash
-img-timeline build ./red.mkv ./out/red_flow.png --mode flow --output-format png --progress
-img-timeline build ./red.mkv ./out/red_flow_dithered_20260303_154840.png --mode flow --output-format png --dither floyd-steinberg --progress
-```
+- Converts each frame to a 1px-high strip in one of two modes:
+  - `average`: one average RGB color for the full row width
+  - `flow`: one color per column chosen from frequent/vibrant quantized colors
+- Stacks strips in deterministic lexical frame order.
+- Supports optional 16-color Floyd-Steinberg dithering on final output.
+- Supports optional writing of intermediate strip images for inspection.
 
-Flow timeline (non-dithered):
+## Current Video Pipeline Behavior
 
-![Red Balloon flow timeline](./assets/red_balloon_flow.png)
+For `build` with video input:
 
-16-color Floyd-Steinberg dithered timeline:
+- Primary path: frames are decoded by `ffmpeg` as raw RGB to memory, then consumed by a bounded in-memory worker pipeline.
+- Backpressure: in-flight frame processing is capped and scales with worker count, so decode cannot run far ahead of strip generation.
+- Fallback path: if `ffprobe` is unavailable, the tool falls back to disk-backed temporary frame extraction.
 
-![Red Balloon dithered timeline](./assets/red_balloon_flow_dithered.png)
+This design reduces temporary full-resolution frame buildup and SSD write pressure in normal operation.
 
-## Why this tool
-
-- Turns thousands of frames into one compact visual summary
-- Deterministic output (sorted filename order)
-- Works as a one-command pipeline or step-by-step workflow
-- Supports optional intermediate strip output for debugging/inspection
-
-## Install
-
-### From source (current method)
-
-First, download the repository:
+## Install (from source)
 
 ```bash
 git clone https://github.com/aelder/image_processing.git
 cd image_processing
+python -m venv .venv
 ```
 
-Then install in a virtual environment:
+Linux/macOS:
 
 ```bash
-python3 -m venv .venv
 source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Install package:
+
+```bash
+pip install -e .
+```
+
+Optional progress bar dependency:
+
+```bash
 pip install -e ".[progress]"
 ```
 
-### Command installed
+## Quickstart
 
-```bash
-img-timeline
-```
-
-### Planned PyPI install
-
-Once published to PyPI, install without cloning:
-
-```bash
-pip install movie-color-timeline
-```
-
-## Quickstart (60 seconds)
-
-1. Put movie frames (for example `.tif`, `.png`, `.jpg`) in a folder, e.g. `./frames` or pass a video file directly.
-2. Run:
+Build from frame folder:
 
 ```bash
 img-timeline build ./frames ./out/movie_timeline.tif --progress
 ```
 
-3. Open `movie_timeline.tif` and scale it up vertically to create a poster-style graphic.
-
-## Cookbook Recipes
-
-### 1) Export TIFF frames from a movie (ffmpeg)
+Build directly from video:
 
 ```bash
-mkdir -p ./frames
-ffmpeg -i ./movie.mp4 -vsync 0 ./frames/%06d.tif
-```
-
-### 2) Build a timeline in one command (from frames or directly from a movie)
-
-```bash
-mkdir -p ./out
-img-timeline build ./frames ./out/movie_timeline.tif --progress
-img-timeline build ./movie.mp4 ./out/movie_timeline.png --output-format png --progress
 img-timeline build ./movie.mp4 ./out/movie_flow.png --mode flow --output-format png --progress
 ```
 
-### 3) Keep intermediate strips for inspection
+Equivalent module invocation:
 
 ```bash
-mkdir -p ./out/strips
+python -m img_timeline build ./movie.mp4 ./out/movie_flow.png --mode flow --output-format png --progress
+```
+
+## CLI Commands
+
+| Command | Purpose |
+|---|---|
+| `img-timeline build <input_path> <output_file>` | Full pipeline from frame directory or video to final timeline |
+| `img-timeline convert <input_folder> <output_folder>` | Legacy step: convert frames to 1px strips |
+| `img-timeline stack <input_folder> <output_file>` | Legacy step: stack strip files into final timeline |
+| `img-timeline generate-demo <output_dir>` | Generate synthetic demo TIFF frames |
+
+### `build` Options
+
+- `--mode {average,flow}` (default: `average`)
+- `--workers <n>` (default: auto for larger `flow`; otherwise 1)
+- `--output-format {tiff,png}` (default: inferred from output extension, TIFF if no extension)
+- `--intermediate-dir <dir>` (write intermediate strips)
+- `--progress` (show progress bars when `tqdm` is installed)
+- `--dither {none,floyd-steinberg}` (default: `none`)
+- `--palette-color <#RRGGBB>` (repeat exactly 16 times, requires `--dither floyd-steinberg`)
+
+### `convert` Options
+
+- `--mode {average,flow}` (default: `average`)
+- `--workers <n>`
+- `--output-format {tiff,png}` (default: `tiff`)
+
+### `stack` Options
+
+- `--output-format {tiff,png}` (default: inferred from output extension, TIFF if no extension)
+- `--progress`
+- `--dither {none,floyd-steinberg}`
+- `--palette-color <#RRGGBB>` (repeat exactly 16 times with dithering)
+
+## Examples
+
+Create flow timeline from `matrix.mkv`:
+
+```powershell
+python -m img_timeline build .\matrix.mkv .\out\matrix_flow.png --mode flow --output-format png --progress
+```
+
+Force worker count:
+
+```bash
+img-timeline build ./movie.mp4 ./out/movie_flow.png --mode flow --output-format png --workers 8 --progress
+```
+
+Write intermediate strips:
+
+```bash
 img-timeline build ./frames ./out/movie_timeline.tif --intermediate-dir ./out/strips --progress
 ```
 
-### 4) Legacy two-step workflow
+Dither final output with default palette:
 
 ```bash
-img-timeline convert ./frames ./out/strips
-img-timeline convert ./frames ./out/flow_strips --mode flow --output-format png
-img-timeline stack ./out/strips ./out/movie_timeline.tif --progress
+img-timeline build ./movie.mp4 ./out/movie_flow_dithered.png --mode flow --output-format png --dither floyd-steinberg --progress
 ```
 
-### 5) Make a poster-style image from the timeline
-
-`movie_timeline.tif` is typically narrow (often 1-2px wide). Scale it up in an editor or with ImageMagick:
-
-```bash
-magick ./out/movie_timeline.tif -filter point -resize 2000x30000! ./out/movie_poster.png
-```
-
-Use `-filter point` to preserve hard row boundaries without blending.
-
-## CLI Reference
-
-| Command | Purpose | Example |
-|---|---|---|
-| `img-timeline build <input_path> <output_file>` | Full pipeline from source frames/video to final timeline | `img-timeline build ./frames ./out/timeline.tif` |
-| `img-timeline convert <input_folder> <output_folder>` | Convert each frame to a 1px strip (average or flow mode) | `img-timeline convert ./frames ./out/strips --mode flow` |
-| `img-timeline stack <input_folder> <output_file>` | Stack strips into final timeline (optional palette dithering) | `img-timeline stack ./out/strips ./out/timeline.tif` |
-| `img-timeline generate-demo <output_dir>` | Create synthetic TIFF frames for testing | `img-timeline generate-demo ./demo_frames --count 500 --size 2` |
-
-### Useful flags
-
-- `--progress`: show progress bars (requires `tqdm`)
-- `--intermediate-dir <dir>` (for `build`): also write 1px strip images (TIFF/PNG based on output format)
-- `--output-format {tiff,png}` (for `build`, `convert`, `stack`): choose output encoding. Default is TIFF unless output filename ends with `.png`.
-- `--mode {average,flow}` (for `build`, `convert`): choose row extraction mode. `average` is the default for compatibility.
-- `--workers <n>` (for `build`, `convert`): number of worker processes for frame/strip generation. If omitted, `flow` mode auto-parallelizes on larger inputs.
-- `--dither {none,floyd-steinberg}` (for `build`, `stack`): apply Floyd-Steinberg dithering to the final output image.
-- `--palette-color <#RRGGBB>` (repeatable, for `build`, `stack`): provide exactly 16 custom palette colors for dithering.
-
-## How output is computed
-
-For each input frame:
-
-1. Convert to RGB
-2. Build a 1px-high row using selected mode:
-   - `average`: one average RGB color for the full row
-   - `flow`: one color per column chosen from the most frequent + vibrant quantized column color
-3. Assign one output row to that frame
-
-Final timeline dimensions:
-
-- Width: max width across input frames
-- Height: number of input frames
-
-### red.mkv flow example
-
-```bash
-img-timeline build ./red.mkv ./out/red_flow.png --mode flow --output-format png --progress
-```
-
-### 16-color dithering examples
-
-```bash
-img-timeline build ./red.mkv ./out/red_flow_dithered.png --mode flow --output-format png --dither floyd-steinberg --progress
-img-timeline stack ./out/strips ./out/timeline_dithered.png --output-format png --dither floyd-steinberg
-```
-
-Custom palette (exactly 16 entries):
+Custom 16-color palette:
 
 ```bash
 img-timeline build ./frames ./out/timeline_custom_palette.png --output-format png --dither floyd-steinberg \
@@ -177,34 +149,54 @@ img-timeline build ./frames ./out/timeline_custom_palette.png --output-format pn
   --palette-color '#B58454' --palette-color '#A4A87C' --palette-color '#C9B27A' --palette-color '#F1E5BE'
 ```
 
-## Recommended frame naming
+Legacy two-step workflow:
 
-Use zero-padded names so lexical sort matches frame order:
+```bash
+img-timeline convert ./frames ./out/strips --mode flow --output-format png
+img-timeline stack ./out/strips ./out/movie_timeline.tif --progress
+```
+
+## Output Semantics
+
+- Timeline width = max input frame width.
+- Timeline height = number of source frames.
+- Ordering is lexical sort by filename for folder inputs.
+- Default output mode is RGB.
+- With `--dither floyd-steinberg`, final image is paletted (`P`) with 16 colors.
+
+## Recommended Frame Naming
+
+Use zero-padded names so lexical sort matches chronological order:
 
 - Good: `000001.tif`, `000002.tif`, ...
 - Risky: `1.tif`, `10.tif`, `2.tif`
-
-## Legacy script entrypoints (still supported)
-
-- `python3 tif_pipeline.py ...`
-- `python3 tif_convert.py ...`
-- `python3 tif_stacker.py ...`
-- `python3 generate_rainbow_tiffs.py ...`
 
 ## Requirements
 
 - Python 3.10+
 - NumPy
 - Pillow
+- `ffmpeg` (for video inputs)
+- `ffprobe` (recommended for primary in-memory video path; without it, disk fallback is used)
 - Optional: `tqdm` for progress bars
 
 ## Troubleshooting
 
-- `FileNotFoundError`: input path is wrong.
-- `ValueError: No supported image files found`: input directory has no supported image files.
-- `ValueError: Output file extension must be ...`: use `.tif`/`.tiff`/`.png`, or provide `--output-format`.
-- `RuntimeError: ffmpeg is required`: install ffmpeg or provide a directory of image frames.
-- If `pip install -e .` fails with an externally-managed Python error, install inside a virtual environment (see Install section).
+- `FileNotFoundError`: input path is invalid.
+- `ValueError: No supported image files found`: input folder has no supported image files.
+- `ValueError: Output file extension must be ...`: use `.tif/.tiff/.png` or provide `--output-format`.
+- `RuntimeError: ffmpeg is required`: install ffmpeg or use an image folder input.
+- `RuntimeError: Failed to extract frames from video ...`: ffmpeg/ffprobe could not decode/probe the video.
+- `--palette-color` without `--dither floyd-steinberg` is rejected.
+
+## Legacy Script Wrappers
+
+These remain available for compatibility:
+
+- `python tif_pipeline.py ...`
+- `python tif_convert.py ...`
+- `python tif_stacker.py ...`
+- `python generate_rainbow_tiffs.py ...`
 
 ## License
 

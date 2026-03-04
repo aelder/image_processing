@@ -7,8 +7,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 from PIL import Image, ImageStat
@@ -68,6 +70,8 @@ FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD = 0.50
 FLOW_NEAR_BLACK_PENALTY_MULTIPLIER = 0.15
 FLOW_NEAR_BLACK_DOMINANCE_BOOST = 0.20
 DEFAULT_AUTO_MIN_FRAMES = 8
+VIDEO_POLL_INTERVAL_SECONDS = 0.05
+VIDEO_INFLIGHT_MULTIPLIER = 2
 
 
 def iter_image_files(input_folder: Path) -> list[Path]:
@@ -288,8 +292,451 @@ def _extract_video_frames(video_file: Path, frame_dir: Path) -> None:
         raise RuntimeError(f"Failed to extract frames from video '{video_file}': {error_details}")
 
 
+def _start_video_frame_extractor(video_file: Path, frame_dir: Path) -> subprocess.Popen[str]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "ffmpeg is required to process video files. Install ffmpeg or "
+            "provide a directory of image frames."
+        )
+
+    output_pattern = frame_dir / "%09d.png"
+    return subprocess.Popen(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_file),
+            "-vsync",
+            "0",
+            str(output_pattern),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _parse_video_dimensions(raw_output: str, video_file: Path) -> tuple[int, int]:
+    lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
+    if len(lines) >= 2 and lines[0].isdigit() and lines[1].isdigit():
+        width = int(lines[0])
+        height = int(lines[1])
+    else:
+        match = re.search(r"(\d+)\s*x\s*(\d+)", raw_output)
+        if not match:
+            raise RuntimeError(
+                f"Unable to parse video dimensions for '{video_file}' from ffprobe output: "
+                f"{raw_output.strip()!r}"
+            )
+        width = int(match.group(1))
+        height = int(match.group(2))
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid probed dimensions for '{video_file}': {width}x{height}")
+    return width, height
+
+
+def _probe_video_dimensions(video_file: Path) -> tuple[int, int]:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError("ffprobe is required for in-memory video processing.")
+
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_file),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip() or "Unknown ffprobe error"
+        raise RuntimeError(f"Failed to probe video stream metadata for '{video_file}': {details}")
+
+    return _parse_video_dimensions(result.stdout, video_file)
+
+
+def _start_video_raw_extractor(video_file: Path) -> subprocess.Popen[bytes]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "ffmpeg is required to process video files. Install ffmpeg or "
+            "provide a directory of image frames."
+        )
+
+    return subprocess.Popen(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_file),
+            "-vsync",
+            "0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _read_exact_bytes(stream: BinaryIO, byte_count: int) -> bytes:
+    buffer = bytearray()
+    while len(buffer) < byte_count:
+        chunk = stream.read(byte_count - len(buffer))
+        if not chunk:
+            break
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def _read_raw_video_frame(stream: BinaryIO, frame_byte_count: int) -> bytes | None:
+    frame = _read_exact_bytes(stream, frame_byte_count)
+    if not frame:
+        return None
+    if len(frame) != frame_byte_count:
+        raise RuntimeError("Incomplete raw frame read from ffmpeg stream.")
+    return frame
+
+
+def _normalize_video_workers(workers: int | None, mode: str) -> int:
+    if workers is not None:
+        if workers <= 0:
+            raise ValueError("workers must be greater than 0")
+        return workers
+    if mode != "flow":
+        return 1
+    return max(1, os.cpu_count() or 1)
+
+
+def _video_frame_path(frame_dir: Path, frame_number: int) -> Path:
+    return frame_dir / f"{frame_number:09d}.png"
+
+
+def _video_frame_ready(frame_dir: Path, frame_number: int, extractor_done: bool) -> bool:
+    frame_path = _video_frame_path(frame_dir, frame_number)
+    if not frame_path.exists():
+        return False
+    if extractor_done:
+        return True
+    return _video_frame_path(frame_dir, frame_number + 1).exists()
+
+
+def _process_video_frames_streaming_disk(
+    input_video: Path,
+    output_file: Path,
+    mode: str,
+    workers: int | None,
+    show_progress: bool,
+    intermediate_dir: Path | None,
+    output_format: str,
+) -> tuple[list[tuple[int, bytes]], int]:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir_obj = tempfile.TemporaryDirectory(dir=str(output_file.parent))
+    temp_dir = Path(temp_dir_obj.name)
+    extractor = _start_video_frame_extractor(input_video, temp_dir)
+    worker_count = _normalize_video_workers(workers, mode)
+    max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
+    rows: list[tuple[int, bytes] | None] = []
+    max_width = 0
+    next_frame_number = 1
+    inflight: dict[concurrent.futures.Future[tuple[int, bytes]], tuple[int, Path]] = {}
+    progress_bar = tqdm(desc="Processing frames", unit="frame") if show_progress and tqdm else None
+
+    try:
+        if worker_count == 1:
+            while True:
+                extractor_done = extractor.poll() is not None
+                if _video_frame_ready(temp_dir, next_frame_number, extractor_done):
+                    frame_path = _video_frame_path(temp_dir, next_frame_number)
+                    row_index = next_frame_number - 1
+                    width, data = _build_strip_from_path(frame_path, mode)
+                    while len(rows) <= row_index:
+                        rows.append(None)
+                    rows[row_index] = (width, data)
+                    if width > max_width:
+                        max_width = width
+                    if intermediate_dir is not None:
+                        strip = Image.frombytes("RGB", (width, 1), data)
+                        strip.save(_intermediate_path(intermediate_dir, frame_path, output_format))
+                    frame_path.unlink(missing_ok=True)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    next_frame_number += 1
+                    continue
+
+                if extractor_done:
+                    break
+                time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                while True:
+                    extractor_done = extractor.poll() is not None
+                    while len(inflight) < max_inflight and _video_frame_ready(
+                        temp_dir, next_frame_number, extractor_done
+                    ):
+                        frame_path = _video_frame_path(temp_dir, next_frame_number)
+                        row_index = next_frame_number - 1
+                        future = executor.submit(_build_strip_from_path, frame_path, mode)
+                        inflight[future] = (row_index, frame_path)
+                        next_frame_number += 1
+
+                    if inflight:
+                        done, _ = concurrent.futures.wait(
+                            inflight.keys(),
+                            timeout=VIDEO_POLL_INTERVAL_SECONDS,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            row_index, frame_path = inflight.pop(future)
+                            width, data = future.result()
+                            while len(rows) <= row_index:
+                                rows.append(None)
+                            rows[row_index] = (width, data)
+                            if width > max_width:
+                                max_width = width
+
+                            if intermediate_dir is not None:
+                                strip = Image.frombytes("RGB", (width, 1), data)
+                                strip.save(
+                                    _intermediate_path(intermediate_dir, frame_path, output_format)
+                                )
+
+                            frame_path.unlink(missing_ok=True)
+                            if progress_bar is not None:
+                                progress_bar.update(1)
+                    else:
+                        if extractor_done:
+                            break
+                        time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
+
+        stderr_output = extractor.stderr.read().strip() if extractor.stderr is not None else ""
+        if extractor.returncode and extractor.returncode != 0:
+            details = stderr_output or "Unknown ffmpeg error"
+            raise RuntimeError(f"Failed to extract frames from video '{input_video}': {details}")
+
+        if any(row is None for row in rows):
+            raise RuntimeError(
+                f"Non-contiguous frame sequence extracted from video '{input_video}'."
+            )
+
+        dense_rows = [row for row in rows if row is not None]
+        if not dense_rows:
+            raise ValueError(f"No frames extracted from video file: {input_video}")
+        return dense_rows, max_width
+    finally:
+        if extractor.poll() is None:
+            extractor.terminate()
+            try:
+                extractor.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                extractor.kill()
+                extractor.wait(timeout=5)
+        if extractor.stderr is not None:
+            extractor.stderr.close()
+        if progress_bar is not None:
+            progress_bar.close()
+        temp_dir_obj.cleanup()
+
+
+def _build_strip_from_frame_bytes(
+    frame_data: bytes,
+    width: int,
+    height: int,
+    mode: str,
+) -> tuple[int, bytes]:
+    image = Image.frombytes("RGB", (width, height), frame_data)
+    strip = _build_strip(image, mode)
+    return strip.size[0], strip.tobytes()
+
+
+def _process_video_frames_streaming_in_memory(
+    input_video: Path,
+    mode: str,
+    workers: int | None,
+    show_progress: bool,
+    intermediate_dir: Path | None,
+    output_format: str,
+) -> tuple[list[tuple[int, bytes]], int]:
+    frame_width, frame_height = _probe_video_dimensions(input_video)
+    frame_byte_count = frame_width * frame_height * 3
+    extractor = _start_video_raw_extractor(input_video)
+    worker_count = _normalize_video_workers(workers, mode)
+    max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
+    rows: list[tuple[int, bytes] | None] = []
+    max_width = 0
+    progress_bar = tqdm(desc="Processing frames", unit="frame") if show_progress and tqdm else None
+
+    try:
+        stdout_stream = extractor.stdout
+        if stdout_stream is None:
+            raise RuntimeError("Failed to initialize ffmpeg frame stream.")
+
+        if worker_count == 1:
+            frame_number = 1
+            while True:
+                frame_data = _read_raw_video_frame(stdout_stream, frame_byte_count)
+                if frame_data is None:
+                    break
+                row_index = frame_number - 1
+                width, data = _build_strip_from_frame_bytes(
+                    frame_data,
+                    frame_width,
+                    frame_height,
+                    mode,
+                )
+                while len(rows) <= row_index:
+                    rows.append(None)
+                rows[row_index] = (width, data)
+                if width > max_width:
+                    max_width = width
+                if intermediate_dir is not None:
+                    strip = Image.frombytes("RGB", (width, 1), data)
+                    frame_name = Path(f"{frame_number:09d}.png")
+                    strip.save(_intermediate_path(intermediate_dir, frame_name, output_format))
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                frame_number += 1
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                inflight: dict[concurrent.futures.Future[tuple[int, bytes]], tuple[int, int]] = {}
+                next_frame_number = 1
+                reached_end = False
+
+                while True:
+                    while not reached_end and len(inflight) < max_inflight:
+                        frame_data = _read_raw_video_frame(stdout_stream, frame_byte_count)
+                        if frame_data is None:
+                            reached_end = True
+                            break
+                        row_index = next_frame_number - 1
+                        future = executor.submit(
+                            _build_strip_from_frame_bytes,
+                            frame_data,
+                            frame_width,
+                            frame_height,
+                            mode,
+                        )
+                        inflight[future] = (row_index, next_frame_number)
+                        next_frame_number += 1
+
+                    if not inflight:
+                        if reached_end:
+                            break
+                        continue
+
+                    done, _ = concurrent.futures.wait(
+                        inflight.keys(),
+                        timeout=VIDEO_POLL_INTERVAL_SECONDS,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+
+                    for future in done:
+                        row_index, frame_number = inflight.pop(future)
+                        width, data = future.result()
+                        while len(rows) <= row_index:
+                            rows.append(None)
+                        rows[row_index] = (width, data)
+                        if width > max_width:
+                            max_width = width
+                        if intermediate_dir is not None:
+                            strip = Image.frombytes("RGB", (width, 1), data)
+                            frame_name = Path(f"{frame_number:09d}.png")
+                            strip.save(
+                                _intermediate_path(intermediate_dir, frame_name, output_format)
+                            )
+                        if progress_bar is not None:
+                            progress_bar.update(1)
+
+        extractor.wait(timeout=5)
+        stderr_output = (
+            extractor.stderr.read().decode("utf-8", errors="replace").strip()
+            if extractor.stderr is not None
+            else ""
+        )
+        if extractor.returncode and extractor.returncode != 0:
+            details = stderr_output or "Unknown ffmpeg error"
+            raise RuntimeError(f"Failed to extract frames from video '{input_video}': {details}")
+
+        if any(row is None for row in rows):
+            raise RuntimeError(
+                f"Non-contiguous frame sequence extracted from video '{input_video}'."
+            )
+
+        dense_rows = [row for row in rows if row is not None]
+        if not dense_rows:
+            raise ValueError(f"No frames extracted from video file: {input_video}")
+        return dense_rows, max_width
+    finally:
+        if extractor.poll() is None:
+            extractor.terminate()
+            try:
+                extractor.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                extractor.kill()
+                extractor.wait(timeout=5)
+        if extractor.stdout is not None:
+            extractor.stdout.close()
+        if extractor.stderr is not None:
+            extractor.stderr.close()
+        if progress_bar is not None:
+            progress_bar.close()
+
+
+def _process_video_frames_streaming(
+    input_video: Path,
+    output_file: Path,
+    mode: str,
+    workers: int | None,
+    show_progress: bool,
+    intermediate_dir: Path | None,
+    output_format: str,
+) -> tuple[list[tuple[int, bytes]], int]:
+    try:
+        return _process_video_frames_streaming_in_memory(
+            input_video=input_video,
+            mode=mode,
+            workers=workers,
+            show_progress=show_progress,
+            intermediate_dir=intermediate_dir,
+            output_format=output_format,
+        )
+    except RuntimeError as error:
+        if "ffprobe is required for in-memory video processing." not in str(error):
+            raise
+        return _process_video_frames_streaming_disk(
+            input_video=input_video,
+            output_file=output_file,
+            mode=mode,
+            workers=workers,
+            show_progress=show_progress,
+            intermediate_dir=intermediate_dir,
+            output_format=output_format,
+        )
+
+
 def _collect_source_images(
     input_path: Path,
+    temp_parent_dir: Path | None = None,
 ) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
     if input_path.is_dir():
         image_files = iter_image_files(input_path)
@@ -298,7 +745,11 @@ def _collect_source_images(
         return image_files, None
 
     if _is_video_file(input_path):
-        temp_dir_obj = tempfile.TemporaryDirectory()
+        if temp_parent_dir is not None:
+            temp_parent_dir.mkdir(parents=True, exist_ok=True)
+            temp_dir_obj = tempfile.TemporaryDirectory(dir=str(temp_parent_dir))
+        else:
+            temp_dir_obj = tempfile.TemporaryDirectory()
         temp_dir = Path(temp_dir_obj.name)
         _extract_video_frames(input_path, temp_dir)
         image_files = iter_image_files(temp_dir)
@@ -524,73 +975,89 @@ def build_timeline_from_frames(
 ) -> int:
     normalized_format = _normalize_output_format(output_format, output_file=output_file)
     normalized_mode = _normalize_mode(mode)
-    image_files, temp_dir_obj = _collect_source_images(input_folder)
 
-    try:
-        if intermediate_dir is not None:
-            intermediate_dir.mkdir(parents=True, exist_ok=True)
+    if intermediate_dir is not None:
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-        worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
-        rows: list[tuple[int, bytes]] = [(0, b"")] * len(image_files)
-        max_width = 0
+    if _is_video_file(input_folder):
+        rows, max_width = _process_video_frames_streaming(
+            input_video=input_folder,
+            output_file=output_file,
+            mode=normalized_mode,
+            workers=workers,
+            show_progress=show_progress,
+            intermediate_dir=intermediate_dir,
+            output_format=normalized_format,
+        )
+    else:
+        image_files, temp_dir_obj = _collect_source_images(
+            input_folder,
+            temp_parent_dir=output_file.parent,
+        )
+        try:
+            worker_count = _normalize_workers(workers, normalized_mode, len(image_files))
+            rows: list[tuple[int, bytes]] = [(0, b"")] * len(image_files)
+            max_width = 0
 
-        if worker_count == 1:
-            for row_index, path in enumerate(
-                _progress(image_files, show_progress, desc="Processing frames")
-            ):
-                with Image.open(path) as image:
-                    strip = _build_strip(image, normalized_mode)
-                width = strip.size[0]
-                data = strip.tobytes()
-                rows[row_index] = (width, data)
-                if width > max_width:
-                    max_width = width
-                if intermediate_dir is not None:
-                    strip.save(_intermediate_path(intermediate_dir, path, normalized_format))
-        else:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(_build_strip_from_path, path, normalized_mode): (
-                        row_index,
-                        path,
-                    )
-                    for row_index, path in enumerate(image_files)
-                }
-                for future in _progress(
-                    concurrent.futures.as_completed(futures),
-                    show_progress,
-                    desc="Processing frames",
+            if worker_count == 1:
+                for row_index, path in enumerate(
+                    _progress(image_files, show_progress, desc="Processing frames")
                 ):
-                    row_index, path = futures[future]
-                    width, data = future.result()
+                    with Image.open(path) as image:
+                        strip = _build_strip(image, normalized_mode)
+                    width = strip.size[0]
+                    data = strip.tobytes()
                     rows[row_index] = (width, data)
                     if width > max_width:
                         max_width = width
                     if intermediate_dir is not None:
-                        strip = Image.frombytes("RGB", (width, 1), data)
                         strip.save(_intermediate_path(intermediate_dir, path, normalized_format))
+            else:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                    futures = {
+                        executor.submit(_build_strip_from_path, path, normalized_mode): (
+                            row_index,
+                            path,
+                        )
+                        for row_index, path in enumerate(image_files)
+                    }
+                    for future in _progress(
+                        concurrent.futures.as_completed(futures),
+                        show_progress,
+                        desc="Processing frames",
+                    ):
+                        row_index, path = futures[future]
+                        width, data = future.result()
+                        rows[row_index] = (width, data)
+                        if width > max_width:
+                            max_width = width
+                        if intermediate_dir is not None:
+                            strip = Image.frombytes("RGB", (width, 1), data)
+                            strip.save(
+                                _intermediate_path(intermediate_dir, path, normalized_format)
+                            )
+        finally:
+            if temp_dir_obj is not None:
+                temp_dir_obj.cleanup()
 
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        timeline = Image.new("RGB", (max_width, len(rows)))
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    timeline = Image.new("RGB", (max_width, len(rows)))
 
-        for row_index, (width, data) in enumerate(rows):
-            row = Image.frombytes("RGB", (width, 1), data)
-            timeline.paste(row, (0, row_index))
+    for row_index, (width, data) in enumerate(rows):
+        row = Image.frombytes("RGB", (width, 1), data)
+        timeline.paste(row, (0, row_index))
 
-        timeline = _apply_palette_dither(
-            timeline,
-            dither=dither,
-            palette_colors=palette_colors,
-        )
+    timeline = _apply_palette_dither(
+        timeline,
+        dither=dither,
+        palette_colors=palette_colors,
+    )
 
-        if normalized_format == "png":
-            timeline.save(output_file, format="PNG")
-        else:
-            timeline.save(output_file, format="TIFF")
-        return len(rows)
-    finally:
-        if temp_dir_obj is not None:
-            temp_dir_obj.cleanup()
+    if normalized_format == "png":
+        timeline.save(output_file, format="PNG")
+    else:
+        timeline.save(output_file, format="TIFF")
+    return len(rows)
 
 
 def generate_rainbow_tiffs(output_dir: Path, count: int = 500, size: int = 2) -> int:
