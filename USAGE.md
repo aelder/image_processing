@@ -20,6 +20,7 @@ Options:
 - `--intermediate-dir <dir>`: also write 1px strip images.
 - `--output-format {tiff,png}`: choose output format (default TIFF unless output filename is `.png`).
 - `--mode {average,flow}`: choose row extraction mode (`average` default).
+- `--flow-profile {exact,fast}`: choose flow extraction profile (`exact` default).
 - `--workers <n>`: number of worker processes. If omitted, `flow` mode auto-parallelizes for larger inputs.
 - `--cuda`: enable CUDA acceleration for `flow` mode (NVDEC decode + CuPy strip compute when available).
 - `--dither {none,floyd-steinberg}`: apply 16-color Floyd-Steinberg dithering to final output.
@@ -35,7 +36,7 @@ support the source stream profile, decode falls back to software while CUDA stri
 ### 2) Convert to strips (legacy step)
 
 ```bash
-img-timeline convert <input_folder> <output_folder> [--output-format tiff|png] [--mode average|flow] [--workers N] [--cuda]
+img-timeline convert <input_folder> <output_folder> [--output-format tiff|png] [--mode average|flow] [--flow-profile exact|fast] [--workers N] [--cuda]
 ```
 
 ### 3) Stack strips (legacy step)

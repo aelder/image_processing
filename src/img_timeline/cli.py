@@ -13,6 +13,7 @@ from .core import (
 
 OUTPUT_FORMAT_CHOICES = ("tiff", "png")
 MODE_CHOICES = ("average", "flow")
+FLOW_PROFILE_CHOICES = ("exact", "fast")
 DITHER_CHOICES = ("none", "floyd-steinberg")
 
 
@@ -72,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
+        "--flow-profile",
+        choices=FLOW_PROFILE_CHOICES,
+        default="exact",
+        help="Flow extraction profile: exact (default) or fast.",
+    )
+    build_parser.add_argument(
         "--cuda",
         action="store_true",
         help="Enable CUDA acceleration (NVDEC decode + CuPy flow strip compute when available).",
@@ -123,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Number of worker processes for strip generation "
             "(flow mode auto-parallelizes when omitted)."
         ),
+    )
+    convert_parser.add_argument(
+        "--flow-profile",
+        choices=FLOW_PROFILE_CHOICES,
+        default="exact",
+        help="Flow extraction profile: exact (default) or fast.",
     )
     convert_parser.add_argument(
         "--cuda",
@@ -202,6 +215,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             mode=args.mode,
             workers=args.workers,
             use_cuda=args.cuda,
+            flow_profile=args.flow_profile,
             dither=args.dither,
             palette_colors=args.palette_color,
         )
@@ -216,6 +230,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             mode=args.mode,
             workers=args.workers,
             use_cuda=args.cuda,
+            flow_profile=args.flow_profile,
         )
         print(f"Processed {count} image file(s) into {args.output_folder}")
         return 0

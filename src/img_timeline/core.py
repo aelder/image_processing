@@ -46,6 +46,7 @@ SUPPORTED_VIDEO_SUFFIXES = {
 OUTPUT_FORMATS = {"tiff", "png"}
 TIMELINE_MODES = {"average", "flow"}
 DITHER_MODES = {"none", "floyd-steinberg"}
+FLOW_PROFILES = {"exact", "fast"}
 PALETTE_COLOR_COUNT = 16
 PALETTE_MIN_DISTANCE = 24
 DEFAULT_FILMIC_16_PALETTE: tuple[tuple[int, int, int], ...] = (
@@ -81,40 +82,174 @@ VIDEO_POLL_INTERVAL_SECONDS = 0.05
 VIDEO_INFLIGHT_MULTIPLIER = 2
 FLOW_BIN_COUNT = 4096
 FLOW_CUDA_BATCH_SIZE = 4
+FLOW_CUDA_BATCH_SIZE_FAST = 16
 VIDEO_FRAME_COUNT_PROBE_TIMEOUT_SECONDS = 1.5
+FLOW_FAST_ROW_STRIDE = 2
 
 _FLOW_CPU_CACHE: dict[tuple[int, int], dict[str, np.ndarray]] = {}
 _FLOW_CUDA_CACHE: dict[tuple[int, int], dict[str, cp.ndarray]] = {}
 _FLOW_CUDA_HISTOGRAM_KERNEL = None
+_FLOW_CUDA_SELECT_KERNEL = None
 _FLOW_CUDA_HISTOGRAM_KERNEL_SOURCE = r"""
 extern "C" __global__
 void flow_histogram_kernel(
     const unsigned char* rgb,
-    const int* packed_bins,
     const int width,
+    const int height,
+    const int batch_size,
     const int frame_pixel_count,
-    const int pixel_count,
+    int* near_black_counts,
     int* counts,
-    float* sum_r,
-    float* sum_g,
-    float* sum_b
+    int* sum_r,
+    int* sum_g,
+    int* sum_b
 ) {
-    int idx = (blockDim.x * blockIdx.x) + threadIdx.x;
-    if (idx >= pixel_count) {
+    int col = (blockDim.x * blockIdx.x) + threadIdx.x;
+    int row = (blockDim.y * blockIdx.y) + threadIdx.y;
+    int frame = blockIdx.z;
+    if (col >= width || row >= height || frame >= batch_size) {
         return;
     }
 
-    int pixel_in_frame = idx % frame_pixel_count;
-    int frame = idx / frame_pixel_count;
-    int col = pixel_in_frame % width;
-    int bin = packed_bins[idx];
-    int offset = ((frame * width + col) * 4096) + bin;
+    int pixel_in_frame = row * width + col;
+    int idx = (frame * frame_pixel_count) + pixel_in_frame;
     int rgb_offset = idx * 3;
+    unsigned char red = rgb[rgb_offset];
+    unsigned char green = rgb[rgb_offset + 1];
+    unsigned char blue = rgb[rgb_offset + 2];
+    int bin = (((int)(red >> 4)) << 8) | (((int)(green >> 4)) << 4) | ((int)(blue >> 4));
+    int offset = ((frame * width + col) * 4096) + bin;
+
+    float red_norm = ((float)red) / 255.0f;
+    float green_norm = ((float)green) / 255.0f;
+    float blue_norm = ((float)blue) / 255.0f;
+    float max_rg = fmaxf(red_norm, green_norm);
+    float maxc = fmaxf(max_rg, blue_norm);
+    float luminance = 0.2126f * red_norm + 0.7152f * green_norm + 0.0722f * blue_norm;
+    if (luminance <= 0.08f && maxc <= 0.30f) {
+        atomicAdd(&near_black_counts[frame], 1);
+    }
 
     atomicAdd(&counts[offset], 1);
-    atomicAdd(&sum_r[offset], (float)rgb[rgb_offset]);
-    atomicAdd(&sum_g[offset], (float)rgb[rgb_offset + 1]);
-    atomicAdd(&sum_b[offset], (float)rgb[rgb_offset + 2]);
+    atomicAdd(&sum_r[offset], (int)red);
+    atomicAdd(&sum_g[offset], (int)green);
+    atomicAdd(&sum_b[offset], (int)blue);
+}
+"""
+_FLOW_CUDA_SELECT_KERNEL_SOURCE = r"""
+extern "C" __global__
+void flow_select_kernel(
+    const int* counts,
+    const int* sum_r,
+    const int* sum_g,
+    const int* sum_b,
+    const float* frame_near_black_ratio,
+    const int width,
+    const int batch_size,
+    const float denominator,
+    const float base_color_weight,
+    const float vibrance_weight,
+    const float luminance_weight,
+    const float near_black_luma_threshold,
+    const float near_black_max_channel_threshold,
+    const float near_black_frame_dominance_threshold,
+    const float near_black_column_dominance_threshold,
+    const float near_black_penalty_multiplier,
+    const float near_black_dominance_boost,
+    unsigned char* rows
+) {
+    int col = (blockDim.x * blockIdx.x) + threadIdx.x;
+    int frame = (blockDim.y * blockIdx.y) + threadIdx.y;
+    if (col >= width || frame >= batch_size) {
+        return;
+    }
+
+    int base_offset = (frame * width + col) * 4096;
+    int best_bin = 0;
+    float best_score = -3.402823466e+38f;
+    int best_count = -1;
+    float best_vibrance = -1.0f;
+    unsigned char best_r = 0;
+    unsigned char best_g = 0;
+    unsigned char best_b = 0;
+    bool frame_is_dark = frame_near_black_ratio[frame] < near_black_frame_dominance_threshold;
+
+    for (int bin = 0; bin < 4096; ++bin) {
+        int offset = base_offset + bin;
+        int count = counts[offset];
+        if (count <= 0) {
+            continue;
+        }
+
+        float count_f = (float)count;
+        float centroid_r_f = nearbyintf((float)sum_r[offset] / count_f);
+        float centroid_g_f = nearbyintf((float)sum_g[offset] / count_f);
+        float centroid_b_f = nearbyintf((float)sum_b[offset] / count_f);
+        unsigned char centroid_r = (unsigned char)centroid_r_f;
+        unsigned char centroid_g = (unsigned char)centroid_g_f;
+        unsigned char centroid_b = (unsigned char)centroid_b_f;
+
+        float r_norm = centroid_r_f / 255.0f;
+        float g_norm = centroid_g_f / 255.0f;
+        float b_norm = centroid_b_f / 255.0f;
+        float max_rg = fmaxf(r_norm, g_norm);
+        float maxc = fmaxf(max_rg, b_norm);
+        float min_rg = fminf(r_norm, g_norm);
+        float minc = fminf(min_rg, b_norm);
+        float saturation = 0.0f;
+        if (maxc != 0.0f) {
+            saturation = (maxc - minc) / maxc;
+        }
+        float vibrance = saturation * maxc;
+        float luminance = 0.2126f * r_norm + 0.7152f * g_norm + 0.0722f * b_norm;
+
+        float freq = count_f / denominator;
+        float score = freq * (
+            base_color_weight + vibrance_weight * vibrance + luminance_weight * luminance
+        );
+        bool near_black_candidate =
+            (luminance <= near_black_luma_threshold) && (maxc <= near_black_max_channel_threshold);
+        if (near_black_candidate && (freq >= near_black_column_dominance_threshold)) {
+            score += near_black_dominance_boost * freq;
+        }
+        if (
+            frame_is_dark
+            && near_black_candidate
+            && (freq < near_black_column_dominance_threshold)
+        ) {
+            score *= near_black_penalty_multiplier;
+        }
+
+        bool better = false;
+        if (score > best_score) {
+            better = true;
+        } else if (score == best_score) {
+            if (count > best_count) {
+                better = true;
+            } else if (count == best_count) {
+                if (vibrance > best_vibrance) {
+                    better = true;
+                } else if (vibrance == best_vibrance && bin < best_bin) {
+                    better = true;
+                }
+            }
+        }
+
+        if (better) {
+            best_score = score;
+            best_count = count;
+            best_vibrance = vibrance;
+            best_bin = bin;
+            best_r = centroid_r;
+            best_g = centroid_g;
+            best_b = centroid_b;
+        }
+    }
+
+    int row_offset = (frame * width + col) * 3;
+    rows[row_offset] = best_r;
+    rows[row_offset + 1] = best_g;
+    rows[row_offset + 2] = best_b;
 }
 """
 
@@ -199,6 +334,16 @@ def _normalize_mode(mode: str | None) -> str:
     if normalized not in TIMELINE_MODES:
         allowed = ", ".join(sorted(TIMELINE_MODES))
         raise ValueError(f"Unsupported mode: {mode}. Choose one of: {allowed}")
+    return normalized
+
+
+def _normalize_flow_profile(flow_profile: str | None) -> str:
+    normalized = "exact" if flow_profile is None else flow_profile.lower()
+    if normalized not in FLOW_PROFILES:
+        allowed = ", ".join(sorted(FLOW_PROFILES))
+        raise ValueError(
+            f"Unsupported flow profile: {flow_profile}. Choose one of: {allowed}"
+        )
     return normalized
 
 
@@ -372,6 +517,7 @@ def _start_video_frame_extractor(
     video_file: Path,
     frame_dir: Path,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
 ) -> subprocess.Popen[str]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
@@ -387,6 +533,7 @@ def _start_video_frame_extractor(
         "-loglevel",
         "error",
     ]
+    normalized_flow_profile = _normalize_flow_profile(flow_profile)
     if use_cuda:
         command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
     command.extend(
@@ -398,7 +545,12 @@ def _start_video_frame_extractor(
         ]
     )
     if use_cuda:
-        command.extend(["-vf", "hwdownload,format=rgb24"])
+        filter_steps = ["hwdownload", "format=rgb24"]
+        if normalized_flow_profile == "fast":
+            filter_steps.append("scale=iw:ceil(ih/2):flags=fast_bilinear")
+        command.extend(["-vf", ",".join(filter_steps)])
+    elif normalized_flow_profile == "fast":
+        command.extend(["-vf", "scale=iw:ceil(ih/2):flags=fast_bilinear,format=rgb24"])
     command.append(str(output_pattern))
 
     return subprocess.Popen(
@@ -502,7 +654,11 @@ def _probe_video_frame_count(video_file: Path) -> int | None:
     return frame_count
 
 
-def _start_video_raw_extractor(video_file: Path, use_cuda: bool = False) -> subprocess.Popen[bytes]:
+def _start_video_raw_extractor(
+    video_file: Path,
+    use_cuda: bool = False,
+    flow_profile: str = "exact",
+) -> subprocess.Popen[bytes]:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
@@ -516,6 +672,7 @@ def _start_video_raw_extractor(video_file: Path, use_cuda: bool = False) -> subp
         "-loglevel",
         "error",
     ]
+    normalized_flow_profile = _normalize_flow_profile(flow_profile)
     if use_cuda:
         command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
     command.extend(
@@ -527,7 +684,12 @@ def _start_video_raw_extractor(video_file: Path, use_cuda: bool = False) -> subp
         ]
     )
     if use_cuda:
-        command.extend(["-vf", "hwdownload,format=rgb24"])
+        filter_steps = ["hwdownload", "format=rgb24"]
+        if normalized_flow_profile == "fast":
+            filter_steps.append("scale=iw:ceil(ih/2):flags=fast_bilinear")
+        command.extend(["-vf", ",".join(filter_steps)])
+    elif normalized_flow_profile == "fast":
+        command.extend(["-vf", "scale=iw:ceil(ih/2):flags=fast_bilinear,format=rgb24"])
     command.extend(
         [
             "-f",
@@ -600,11 +762,17 @@ def _process_video_frames_streaming_disk(
     output_format: str,
     use_cuda_compute: bool = False,
     use_cuda_decode: bool = False,
+    flow_profile: str = "exact",
 ) -> tuple[list[tuple[int, bytes]], int]:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temp_dir_obj = tempfile.TemporaryDirectory(dir=str(output_file.parent))
     temp_dir = Path(temp_dir_obj.name)
-    extractor = _start_video_frame_extractor(input_video, temp_dir, use_cuda=use_cuda_decode)
+    extractor = _start_video_frame_extractor(
+        input_video,
+        temp_dir,
+        use_cuda=use_cuda_decode,
+        flow_profile=flow_profile,
+    )
     worker_count = _normalize_video_workers(workers, mode, use_cuda=use_cuda_compute)
     max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
     rows: list[tuple[int, bytes] | None] = []
@@ -629,6 +797,7 @@ def _process_video_frames_streaming_disk(
                         frame_path,
                         mode,
                         use_cuda=use_cuda_compute,
+                        flow_profile=flow_profile,
                     )
                     while len(rows) <= row_index:
                         rows.append(None)
@@ -661,6 +830,7 @@ def _process_video_frames_streaming_disk(
                             frame_path,
                             mode,
                             use_cuda_compute,
+                            flow_profile,
                         )
                         inflight[future] = (row_index, frame_path)
                         next_frame_number += 1
@@ -729,9 +899,10 @@ def _build_strip_from_frame_bytes(
     height: int,
     mode: str,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
 ) -> tuple[int, bytes]:
     image = Image.frombytes("RGB", (width, height), frame_data)
-    strip = _build_strip(image, mode, use_cuda=use_cuda)
+    strip = _build_strip(image, mode, use_cuda=use_cuda, flow_profile=flow_profile)
     return strip.size[0], strip.tobytes()
 
 
@@ -744,10 +915,19 @@ def _process_video_frames_streaming_in_memory(
     output_format: str,
     use_cuda_compute: bool = False,
     use_cuda_decode: bool = False,
+    flow_profile: str = "exact",
 ) -> tuple[list[tuple[int, bytes]], int]:
     frame_width, frame_height = _probe_video_dimensions(input_video)
-    frame_byte_count = frame_width * frame_height * 3
-    extractor = _start_video_raw_extractor(input_video, use_cuda=use_cuda_decode)
+    normalized_flow_profile = _normalize_flow_profile(flow_profile)
+    decode_frame_height = frame_height
+    if mode == "flow" and normalized_flow_profile == "fast":
+        decode_frame_height = max(1, (frame_height + 1) // 2)
+    frame_byte_count = frame_width * decode_frame_height * 3
+    extractor = _start_video_raw_extractor(
+        input_video,
+        use_cuda=use_cuda_decode,
+        flow_profile=flow_profile,
+    )
     worker_count = _normalize_video_workers(workers, mode, use_cuda=use_cuda_compute)
     max_inflight = max(1, worker_count * VIDEO_INFLIGHT_MULTIPLIER)
     rows: list[tuple[int, bytes] | None] = []
@@ -797,7 +977,13 @@ def _process_video_frames_streaming_in_memory(
                 frame_numbers: list[int] = [item[0]]
                 frame_batch: list[bytes] = [item[1]]
                 target_batch = (
-                    FLOW_CUDA_BATCH_SIZE if use_cuda_compute and mode == "flow" else 1
+                    (
+                        FLOW_CUDA_BATCH_SIZE_FAST
+                        if flow_profile == "fast"
+                        else FLOW_CUDA_BATCH_SIZE
+                    )
+                    if use_cuda_compute and mode == "flow"
+                    else 1
                 )
 
                 while len(frame_batch) < target_batch:
@@ -815,17 +1001,19 @@ def _process_video_frames_streaming_in_memory(
                     batch_rows = _build_flow_strips_from_frame_batch_bytes(
                         frame_batch,
                         frame_width,
-                        frame_height,
+                        decode_frame_height,
                         use_cuda=use_cuda_compute,
+                        flow_profile=flow_profile,
                     )
                 else:
                     batch_rows = [
                         _build_strip_from_frame_bytes(
                             frame_data,
                             frame_width,
-                            frame_height,
+                            decode_frame_height,
                             mode,
                             use_cuda=use_cuda_compute,
+                            flow_profile=flow_profile,
                         )
                         for frame_data in frame_batch
                     ]
@@ -864,9 +1052,10 @@ def _process_video_frames_streaming_in_memory(
                             _build_strip_from_frame_bytes,
                             frame_data,
                             frame_width,
-                            frame_height,
+                            decode_frame_height,
                             mode,
                             use_cuda_compute,
+                            flow_profile,
                         )
                         inflight[future] = (row_index, next_frame_number)
                         next_frame_number += 1
@@ -945,6 +1134,7 @@ def _process_video_frames_streaming(
     intermediate_dir: Path | None,
     output_format: str,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
 ) -> tuple[list[tuple[int, bytes]], int]:
     try:
         return _process_video_frames_streaming_in_memory(
@@ -956,6 +1146,7 @@ def _process_video_frames_streaming(
             output_format=output_format,
             use_cuda_compute=use_cuda,
             use_cuda_decode=use_cuda,
+            flow_profile=flow_profile,
         )
     except RuntimeError as error:
         if use_cuda and (
@@ -973,6 +1164,7 @@ def _process_video_frames_streaming(
                 output_format=output_format,
                 use_cuda_compute=use_cuda,
                 use_cuda_decode=False,
+                flow_profile=flow_profile,
             )
         if "ffprobe is required for in-memory video processing." not in str(error):
             raise
@@ -986,6 +1178,7 @@ def _process_video_frames_streaming(
             output_format=output_format,
             use_cuda_compute=use_cuda,
             use_cuda_decode=use_cuda,
+            flow_profile=flow_profile,
         )
 
 
@@ -1162,6 +1355,19 @@ def _flow_strip_cpu(image: Image.Image) -> Image.Image:
     return Image.fromarray(row[np.newaxis, :, :], mode="RGB")
 
 
+def _flow_strip_fast_cpu(image: Image.Image) -> Image.Image:
+    rgb = _image_to_rgb_uint8_array(image)
+    row = np.rint(np.mean(rgb, axis=0)).astype(np.uint8)
+    return Image.fromarray(row[np.newaxis, :, :], mode="RGB")
+
+
+def _flow_strip_cpu_profiled(image: Image.Image, flow_profile: str = "exact") -> Image.Image:
+    normalized_profile = _normalize_flow_profile(flow_profile)
+    if normalized_profile == "exact":
+        return _flow_strip_cpu(image)
+    return _flow_strip_fast_cpu(image)
+
+
 def _flow_cuda_cache_for_shape(batch_size: int, width: int):
     cache_key = (batch_size, width)
     cached = _FLOW_CUDA_CACHE.get(cache_key)
@@ -1172,13 +1378,12 @@ def _flow_cuda_cache_for_shape(batch_size: int, width: int):
         raise RuntimeError("CUDA cache requested without CuPy installed.")
 
     cached = {
-        "bin_indices": cp.arange(FLOW_BIN_COUNT, dtype=cp.int32)[cp.newaxis, cp.newaxis, :],
-        "frame_indices": cp.arange(batch_size, dtype=cp.int32)[:, cp.newaxis],
-        "row_indices": cp.arange(width, dtype=cp.int32)[cp.newaxis, :],
+        "near_black_counts": cp.zeros((batch_size,), dtype=cp.int32),
         "counts": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.int32),
-        "sum_r": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
-        "sum_g": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
-        "sum_b": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.float32),
+        "sum_r": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.int32),
+        "sum_g": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.int32),
+        "sum_b": cp.zeros((batch_size, width, FLOW_BIN_COUNT), dtype=cp.int32),
+        "rows": cp.empty((batch_size, width, 3), dtype=cp.uint8),
     }
     _FLOW_CUDA_CACHE[cache_key] = cached
     return cached
@@ -1197,35 +1402,37 @@ def _flow_cuda_histogram_kernel():
     return _FLOW_CUDA_HISTOGRAM_KERNEL
 
 
-def _flow_rows_cuda_from_rgb_batch(rgb_batch: cp.ndarray) -> cp.ndarray:
+def _flow_cuda_select_kernel():
+    global _FLOW_CUDA_SELECT_KERNEL
+    if _FLOW_CUDA_SELECT_KERNEL is not None:
+        return _FLOW_CUDA_SELECT_KERNEL
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CUDA selection kernel requested without CuPy installed.")
+    _FLOW_CUDA_SELECT_KERNEL = cp.RawKernel(
+        _FLOW_CUDA_SELECT_KERNEL_SOURCE,
+        "flow_select_kernel",
+    )
+    return _FLOW_CUDA_SELECT_KERNEL
+
+
+def _flow_rows_cuda_from_rgb_batch(
+    rgb_batch: cp.ndarray,
+    flow_profile: str = "exact",
+) -> cp.ndarray:
+    normalized_profile = _normalize_flow_profile(flow_profile)
+    if normalized_profile == "fast":
+        return cp.rint(cp.mean(rgb_batch.astype(cp.float32), axis=1)).astype(cp.uint8)
     batch_size, height, width, _ = rgb_batch.shape
     denominator = float(height)
     cache = _flow_cuda_cache_for_shape(batch_size, width)
 
-    frame_max_channel = cp.max(rgb_batch.astype(cp.float32), axis=3) / 255.0
-    frame_luminance = (
-        0.2126 * rgb_batch[:, :, :, 0].astype(cp.float32)
-        + 0.7152 * rgb_batch[:, :, :, 1].astype(cp.float32)
-        + 0.0722 * rgb_batch[:, :, :, 2].astype(cp.float32)
-    ) / 255.0
-    frame_near_black_ratio = cp.mean(
-        (frame_luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD)
-        & (frame_max_channel <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD),
-        axis=(1, 2),
-    )
-
-    quantized = rgb_batch // FLOW_QUANTIZATION_SIZE
-    packed_bins = (
-        (quantized[:, :, :, 0].astype(cp.int32) << 8)
-        | (quantized[:, :, :, 1].astype(cp.int32) << 4)
-        | quantized[:, :, :, 2].astype(cp.int32)
-    )
-
-    bin_indices_flat = packed_bins.ravel()
+    near_black_counts = cache["near_black_counts"]
     counts = cache["counts"]
     sum_r = cache["sum_r"]
     sum_g = cache["sum_g"]
     sum_b = cache["sum_b"]
+    rows = cache["rows"]
+    near_black_counts.fill(0)
     counts.fill(0)
     sum_r.fill(0)
     sum_g.fill(0)
@@ -1233,97 +1440,69 @@ def _flow_rows_cuda_from_rgb_batch(rgb_batch: cp.ndarray) -> cp.ndarray:
 
     kernel = _flow_cuda_histogram_kernel()
     frame_pixel_count = int(height * width)
-    pixel_count = int(batch_size * frame_pixel_count)
-    threads_per_block = 256
-    blocks = (pixel_count + threads_per_block - 1) // threads_per_block
+    threads_per_block = (16, 16, 1)
+    blocks = (
+        (width + threads_per_block[0] - 1) // threads_per_block[0],
+        (height + threads_per_block[1] - 1) // threads_per_block[1],
+        batch_size,
+    )
     kernel(
-        (blocks,),
-        (threads_per_block,),
+        blocks,
+        threads_per_block,
         (
             rgb_batch.ravel(),
-            bin_indices_flat,
             np.int32(width),
+            np.int32(height),
+            np.int32(batch_size),
             np.int32(frame_pixel_count),
-            np.int32(pixel_count),
+            near_black_counts.ravel(),
             counts.ravel(),
             sum_r.ravel(),
             sum_g.ravel(),
             sum_b.ravel(),
         ),
     )
-
-    used = counts > 0
-    counts_f = counts.astype(cp.float32)
-    safe_counts = cp.where(used, counts_f, 1.0)
-
-    centroid_r = cp.rint(sum_r / safe_counts).astype(cp.uint8)
-    centroid_g = cp.rint(sum_g / safe_counts).astype(cp.uint8)
-    centroid_b = cp.rint(sum_b / safe_counts).astype(cp.uint8)
-
-    r_norm = centroid_r.astype(cp.float32) / 255.0
-    g_norm = centroid_g.astype(cp.float32) / 255.0
-    b_norm = centroid_b.astype(cp.float32) / 255.0
-
-    maxc = cp.maximum(cp.maximum(r_norm, g_norm), b_norm)
-    minc = cp.minimum(cp.minimum(r_norm, g_norm), b_norm)
-    saturation = cp.zeros_like(maxc)
-    nonzero_mask = maxc != 0.0
-    saturation[nonzero_mask] = (maxc[nonzero_mask] - minc[nonzero_mask]) / maxc[nonzero_mask]
-    vibrance = saturation * maxc
-    luminance = 0.2126 * r_norm + 0.7152 * g_norm + 0.0722 * b_norm
-
-    freq = counts_f / denominator
-    score = freq * (
-        FLOW_BASE_COLOR_WEIGHT
-        + FLOW_VIBRANCE_WEIGHT * vibrance
-        + FLOW_LUMINANCE_WEIGHT * luminance
+    frame_near_black_ratio = near_black_counts.astype(cp.float32) / np.float32(frame_pixel_count)
+    select_kernel = _flow_cuda_select_kernel()
+    threads = (32, 8, 1)
+    select_blocks = (
+        (width + threads[0] - 1) // threads[0],
+        (batch_size + threads[1] - 1) // threads[1],
+        1,
     )
-    near_black_candidates = (luminance <= FLOW_NEAR_BLACK_LUMA_THRESHOLD) & (
-        maxc <= FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD
+    select_kernel(
+        select_blocks,
+        threads,
+        (
+            counts.ravel(),
+            sum_r.ravel(),
+            sum_g.ravel(),
+            sum_b.ravel(),
+            frame_near_black_ratio.astype(cp.float32),
+            np.int32(width),
+            np.int32(batch_size),
+            np.float32(denominator),
+            np.float32(FLOW_BASE_COLOR_WEIGHT),
+            np.float32(FLOW_VIBRANCE_WEIGHT),
+            np.float32(FLOW_LUMINANCE_WEIGHT),
+            np.float32(FLOW_NEAR_BLACK_LUMA_THRESHOLD),
+            np.float32(FLOW_NEAR_BLACK_MAX_CHANNEL_THRESHOLD),
+            np.float32(FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD),
+            np.float32(FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
+            np.float32(FLOW_NEAR_BLACK_PENALTY_MULTIPLIER),
+            np.float32(FLOW_NEAR_BLACK_DOMINANCE_BOOST),
+            rows.ravel(),
+        ),
     )
-    score = cp.where(
-        near_black_candidates & (freq >= FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
-        score + FLOW_NEAR_BLACK_DOMINANCE_BOOST * freq,
-        score,
-    )
-    frame_is_dark = (
-        frame_near_black_ratio[:, cp.newaxis, cp.newaxis]
-        < FLOW_NEAR_BLACK_FRAME_DOMINANCE_THRESHOLD
-    )
-    score = cp.where(
-        frame_is_dark & near_black_candidates & (freq < FLOW_NEAR_BLACK_COLUMN_DOMINANCE_THRESHOLD),
-        score * FLOW_NEAR_BLACK_PENALTY_MULTIPLIER,
-        score,
-    )
-
-    invalid_score = cp.asarray(-np.inf, dtype=cp.float32)
-    candidate_score = cp.where(used, score, invalid_score)
-    best_score = cp.max(candidate_score, axis=2, keepdims=True)
-    mask_score = used & (candidate_score == best_score)
-
-    candidate_count = cp.where(mask_score, counts_f, -1.0)
-    best_count = cp.max(candidate_count, axis=2, keepdims=True)
-    mask_count = mask_score & (counts_f == best_count)
-
-    candidate_vibrance = cp.where(mask_count, vibrance, -1.0)
-    best_vibrance = cp.max(candidate_vibrance, axis=2, keepdims=True)
-    mask_vibrance = mask_count & (vibrance == best_vibrance)
-
-    best_bins = cp.min(cp.where(mask_vibrance, cache["bin_indices"], FLOW_BIN_COUNT), axis=2)
-
-    rows = cp.empty((batch_size, width, 3), dtype=cp.uint8)
-    rows[:, :, 0] = centroid_r[cache["frame_indices"], cache["row_indices"], best_bins]
-    rows[:, :, 1] = centroid_g[cache["frame_indices"], cache["row_indices"], best_bins]
-    rows[:, :, 2] = centroid_b[cache["frame_indices"], cache["row_indices"], best_bins]
     return rows
 
 def _flow_strip_cuda_from_rgb(rgb: cp.ndarray) -> Image.Image:
-    rows = _flow_rows_cuda_from_rgb_batch(rgb[cp.newaxis, :, :, :])
+    rows = _flow_rows_cuda_from_rgb_batch(rgb[cp.newaxis, :, :, :], flow_profile="exact")
     row_cpu = cp.asnumpy(rows[0])
     return Image.fromarray(row_cpu[np.newaxis, :, :], mode="RGB")
 
 
-def _flow_strip_cuda(image: Image.Image) -> Image.Image:
+def _flow_strip_cuda(image: Image.Image, flow_profile: str = "exact") -> Image.Image:
     if cp is None:
         raise RuntimeError(
             "CUDA flow processing requested, but CuPy is not installed. "
@@ -1338,7 +1517,9 @@ def _flow_strip_cuda(image: Image.Image) -> Image.Image:
         raise RuntimeError("CUDA flow processing requested, but no CUDA devices were detected.")
 
     rgb = cp.asarray(_image_to_rgb_uint8_array(image))
-    return _flow_strip_cuda_from_rgb(rgb)
+    rows = _flow_rows_cuda_from_rgb_batch(rgb[cp.newaxis, :, :, :], flow_profile=flow_profile)
+    row_cpu = cp.asnumpy(rows[0])
+    return Image.fromarray(row_cpu[np.newaxis, :, :], mode="RGB")
 
 
 def _build_flow_strips_from_frame_batch_bytes(
@@ -1346,12 +1527,20 @@ def _build_flow_strips_from_frame_batch_bytes(
     width: int,
     height: int,
     use_cuda: bool,
+    flow_profile: str = "exact",
 ) -> list[tuple[int, bytes]]:
     if not frame_batch:
         return []
     if not use_cuda or cp is None:
         return [
-            _build_strip_from_frame_bytes(frame_data, width, height, "flow", use_cuda=False)
+            _build_strip_from_frame_bytes(
+                frame_data,
+                width,
+                height,
+                "flow",
+                use_cuda=False,
+                flow_profile=flow_profile,
+            )
             for frame_data in frame_batch
         ]
 
@@ -1359,26 +1548,32 @@ def _build_flow_strips_from_frame_batch_bytes(
         len(frame_batch), height, width, 3
     )
     rgb_batch = cp.asarray(frame_array)
-    rows = _flow_rows_cuda_from_rgb_batch(rgb_batch)
+    rows = _flow_rows_cuda_from_rgb_batch(rgb_batch, flow_profile=flow_profile)
     rows_cpu = cp.asnumpy(rows)
     return [(width, rows_cpu[index].tobytes()) for index in range(len(frame_batch))]
 
 
-def _build_strip(image: Image.Image, mode: str, use_cuda: bool = False) -> Image.Image:
+def _build_strip(
+    image: Image.Image,
+    mode: str,
+    use_cuda: bool = False,
+    flow_profile: str = "exact",
+) -> Image.Image:
     if mode == "average":
         return _average_strip(image)
     if _normalize_cuda(use_cuda, mode):
-        return _flow_strip_cuda(image)
-    return _flow_strip_cpu(image)
+        return _flow_strip_cuda(image, flow_profile=flow_profile)
+    return _flow_strip_cpu_profiled(image, flow_profile=flow_profile)
 
 
 def _build_strip_from_path(
     input_path: Path,
     mode: str,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
 ) -> tuple[int, bytes]:
     with Image.open(input_path) as image:
-        strip = _build_strip(image, mode, use_cuda=use_cuda)
+        strip = _build_strip(image, mode, use_cuda=use_cuda, flow_profile=flow_profile)
     return strip.size[0], strip.tobytes()
 
 
@@ -1389,10 +1584,12 @@ def convert_to_strips(
     mode: str = "average",
     workers: int | None = None,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
 ) -> int:
     _validate_input_folder(input_folder)
     normalized_format = _normalize_output_format(output_format)
     normalized_mode = _normalize_mode(mode)
+    normalized_flow_profile = _normalize_flow_profile(flow_profile)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     image_files = iter_image_files(input_folder)
@@ -1409,7 +1606,12 @@ def convert_to_strips(
     if worker_count == 1:
         for input_path in image_files:
             with Image.open(input_path) as image:
-                strip = _build_strip(image, normalized_mode, use_cuda=use_cuda)
+                strip = _build_strip(
+                    image,
+                    normalized_mode,
+                    use_cuda=use_cuda,
+                    flow_profile=normalized_flow_profile,
+                )
                 strip.save(_intermediate_path(output_folder, input_path, normalized_format))
         return len(image_files)
 
@@ -1420,6 +1622,7 @@ def convert_to_strips(
                 input_path,
                 normalized_mode,
                 use_cuda,
+                normalized_flow_profile,
             ): input_path
             for input_path in image_files
         }
@@ -1489,11 +1692,13 @@ def build_timeline_from_frames(
     mode: str = "average",
     workers: int | None = None,
     use_cuda: bool = False,
+    flow_profile: str = "exact",
     dither: str | None = None,
     palette_colors: list[str] | None = None,
 ) -> int:
     normalized_format = _normalize_output_format(output_format, output_file=output_file)
     normalized_mode = _normalize_mode(mode)
+    normalized_flow_profile = _normalize_flow_profile(flow_profile)
 
     if intermediate_dir is not None:
         intermediate_dir.mkdir(parents=True, exist_ok=True)
@@ -1508,6 +1713,7 @@ def build_timeline_from_frames(
             intermediate_dir=intermediate_dir,
             output_format=normalized_format,
             use_cuda=use_cuda,
+            flow_profile=normalized_flow_profile,
         )
     else:
         image_files, temp_dir_obj = _collect_source_images(
@@ -1530,7 +1736,12 @@ def build_timeline_from_frames(
                     _progress(image_files, show_progress, desc="Processing frames")
                 ):
                     with Image.open(path) as image:
-                        strip = _build_strip(image, normalized_mode, use_cuda=use_cuda)
+                        strip = _build_strip(
+                            image,
+                            normalized_mode,
+                            use_cuda=use_cuda,
+                            flow_profile=normalized_flow_profile,
+                        )
                     width = strip.size[0]
                     data = strip.tobytes()
                     rows[row_index] = (width, data)
@@ -1541,7 +1752,13 @@ def build_timeline_from_frames(
             else:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
                     futures = {
-                        executor.submit(_build_strip_from_path, path, normalized_mode, use_cuda): (
+                        executor.submit(
+                            _build_strip_from_path,
+                            path,
+                            normalized_mode,
+                            use_cuda,
+                            normalized_flow_profile,
+                        ): (
                             row_index,
                             path,
                         )

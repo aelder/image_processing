@@ -388,6 +388,96 @@ class TestImagePipeline(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_timeline_from_frames(source_dir, root / "timeline.tif", workers=0)
 
+    def test_invalid_flow_profile_rejected(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            out_dir = root / "out"
+            source_dir.mkdir(parents=True)
+            Image.new("RGB", (2, 2), (1, 2, 3)).save(source_dir / "a.tif")
+
+            with self.assertRaises(ValueError):
+                convert_to_strips(source_dir, out_dir, mode="flow", flow_profile="turbo")
+
+            with self.assertRaises(ValueError):
+                build_timeline_from_frames(
+                    source_dir,
+                    root / "timeline.tif",
+                    mode="flow",
+                    flow_profile="turbo",
+                )
+
+    def test_flow_profile_default_matches_explicit_exact(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            default_out = root / "default.png"
+            exact_out = root / "exact.png"
+            source_dir.mkdir(parents=True)
+
+            for index in range(5):
+                frame = Image.new("RGB", (5, 4))
+                px = frame.load()
+                for x in range(5):
+                    for y in range(4):
+                        px[x, y] = (
+                            (index * 31 + x * 17 + y * 7) % 256,
+                            (index * 29 + y * 43 + x * 5) % 256,
+                            (index * 11 + x * y * 19) % 256,
+                        )
+                frame.save(source_dir / f"{index:03d}.png")
+
+            build_timeline_from_frames(
+                source_dir,
+                default_out,
+                output_format="png",
+                mode="flow",
+                workers=1,
+            )
+            build_timeline_from_frames(
+                source_dir,
+                exact_out,
+                output_format="png",
+                mode="flow",
+                workers=1,
+                flow_profile="exact",
+            )
+
+            with Image.open(default_out) as default_img, Image.open(exact_out) as exact_img:
+                self.assertEqual(default_img.size, exact_img.size)
+                self.assertEqual(default_img.tobytes(), exact_img.tobytes())
+
+    def test_flow_profile_fast_executes(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "input"
+            output_file = root / "fast.png"
+            source_dir.mkdir(parents=True)
+
+            for index in range(4):
+                frame = Image.new("RGB", (6, 8))
+                px = frame.load()
+                for x in range(6):
+                    for y in range(8):
+                        px[x, y] = (
+                            (index * 37 + x * 19 + y * 5) % 256,
+                            (index * 41 + y * 13 + x * 7) % 256,
+                            (index * 17 + x * y * 11) % 256,
+                        )
+                frame.save(source_dir / f"{index:03d}.png")
+
+            count = build_timeline_from_frames(
+                source_dir,
+                output_file,
+                output_format="png",
+                mode="flow",
+                workers=1,
+                flow_profile="fast",
+            )
+            self.assertEqual(count, 4)
+            with Image.open(output_file) as timeline:
+                self.assertEqual(timeline.size, (6, 4))
+
     def test_flow_mode_prefers_frequent_and_vibrant_column_colors(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -818,7 +908,12 @@ class TestImagePipeline(unittest.TestCase):
                 def close(self):
                     pass
 
-            def fake_start(_video_file: Path, frame_dir: Path, use_cuda: bool = False):
+            def fake_start(
+                _video_file: Path,
+                frame_dir: Path,
+                use_cuda: bool = False,
+                flow_profile: str = "exact",
+            ):
                 Image.new("RGB", (2, 2), (10, 20, 30)).save(frame_dir / "000000001.png")
                 Image.new("RGB", (2, 2), (40, 50, 60)).save(frame_dir / "000000002.png")
                 return self._FakeExtractorProcess()
@@ -1004,6 +1099,7 @@ class TestImagePipeline(unittest.TestCase):
                 width: int,
                 height: int,
                 use_cuda: bool,
+                flow_profile: str = "exact",
             ):
                 batch_sizes.append(len(frame_batch))
                 rows: list[tuple[int, bytes]] = []
@@ -1088,6 +1184,7 @@ class TestImagePipeline(unittest.TestCase):
                 _height: int,
                 _mode: str,
                 use_cuda: bool = False,
+                flow_profile: str = "exact",
             ):
                 raise RuntimeError("Synthetic frame processing failure")
 
@@ -1147,7 +1244,12 @@ class TestImagePipeline(unittest.TestCase):
             video_file.write_bytes(b"dummy")
             captured_frame_dir: Path | None = None
 
-            def fake_start(_video_file: Path, frame_dir: Path, use_cuda: bool = False):
+            def fake_start(
+                _video_file: Path,
+                frame_dir: Path,
+                use_cuda: bool = False,
+                flow_profile: str = "exact",
+            ):
                 nonlocal captured_frame_dir
                 captured_frame_dir = frame_dir
                 Image.new("RGB", (2, 2), (10, 20, 30)).save(frame_dir / "000000001.png")

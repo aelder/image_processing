@@ -96,6 +96,9 @@ python -m img_timeline build ./movie.mp4 ./out/movie_flow.png --mode flow --outp
 ### `build` Options
 
 - `--mode {average,flow}` (default: `average`)
+- `--flow-profile {exact,fast}` (default: `exact`; only used with `--mode flow`)
+  - `exact`: highest fidelity flow scoring (best visual quality, slower)
+  - `fast`: aggressive approximation for speed (lower fidelity)
 - `--workers <n>` (default: auto for larger `flow`; otherwise 1)
 - `--cuda` (enable CUDA acceleration for `flow`: NVDEC decode + CuPy strip compute)
 - `--output-format {tiff,png}` (default: inferred from output extension, TIFF if no extension)
@@ -107,6 +110,7 @@ python -m img_timeline build ./movie.mp4 ./out/movie_flow.png --mode flow --outp
 ### `convert` Options
 
 - `--mode {average,flow}` (default: `average`)
+- `--flow-profile {exact,fast}` (default: `exact`; only used with `--mode flow`)
 - `--workers <n>`
 - `--cuda` (enable CUDA acceleration for `flow` strip compute)
 - `--output-format {tiff,png}` (default: `tiff`)
@@ -197,9 +201,20 @@ Use zero-padded names so lexical sort matches chronological order:
 - `flow` + `--cuda` uses a fixed-bin (`4096`) GPU histogram/reduction implementation that preserves existing flow scoring semantics.
 - CUDA histogram accumulation now uses a dedicated GPU kernel (replacing `cp.add.at`) for lower per-frame overhead.
 - In single-worker video `flow` mode, CUDA processing uses bounded frame batching to reduce launch/transfer overhead while preserving row order.
+- `flow --flow-profile exact` preserves the full flow-scoring behavior and should be used when quality is the priority.
+- `flow --flow-profile fast` trades quality for speed by using a simpler per-column estimate and reduced decode height for video.
 - For most videos this is significantly faster than CPU flow mode, especially at 4K widths.
 - Hardware decode acceleration depends on codec/profile support; unsupported streams transparently use software decode.
 - On this repository's current implementation, a 1000-frame 4K flow CUDA run completed in about 39 seconds on an RTX 4080 during local validation.
+
+## Flow Profile Quality Tradeoff
+
+- `exact` is the reference-quality path. It should be preferred for final renders and when subtle column-level color differences matter.
+- `fast` can visibly lose detail in difficult scenes:
+  - thin highlights and narrow high-contrast edges may be softened
+  - small/rare color regions may be underrepresented
+  - low-light or noisy scenes may look flatter
+- In exchange, `fast` can be materially quicker on long/high-resolution videos.
 
 ## Troubleshooting
 
